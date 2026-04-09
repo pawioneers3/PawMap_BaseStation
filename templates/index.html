@@ -4,9 +4,31 @@
 <head>
     <title>Base Station</title>
     <style>
+        :root {
+            --bg: #f6f7fb;
+            --panel: #ffffff;
+            --text: #111827;
+            --muted: #6b7280;
+            --border: #e5e7eb;
+            --accent: #2563eb;
+            --accent-2: #16a34a;
+            --danger: #dc2626;
+            --warn: #d97706;
+            --shadow: 0 6px 18px rgba(17, 24, 39, 0.08);
+            --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        }
+
         body {
-            font-family: Arial;
-            padding: 20px;
+            margin: 0;
+            font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+            background: var(--bg);
+            color: var(--text);
+        }
+
+        .container {
+            max-width: 1180px;
+            margin: 0 auto;
+            padding: 22px 18px 32px 18px;
         }
 
         .row {
@@ -16,24 +38,72 @@
             flex-wrap: wrap;
         }
 
+        .topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 14px;
+        }
+
+        .title {
+            display: flex;
+            align-items: baseline;
+            gap: 12px;
+        }
+
+        .title h1 {
+            margin: 0;
+            font-size: 18px;
+            letter-spacing: 0.2px;
+        }
+
+        .subtitle {
+            font-size: 12px;
+            color: var(--muted);
+        }
+
+        .muted {
+            color: var(--muted);
+        }
+
         button {
             padding: 10px 12px;
-            border-radius: 8px;
-            border: 1px solid #ddd;
-            background: #f7f7f7;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            background: #fff;
+            color: var(--text);
             cursor: pointer;
+            box-shadow: none;
         }
 
         button:hover {
-            background: #efefef;
+            background: #f9fafb;
+        }
+
+        button.primary {
+            border-color: rgba(37, 99, 235, 0.35);
+            background: rgba(37, 99, 235, 0.10);
         }
 
         input {
             box-sizing: border-box;
             padding: 10px;
             border-radius: 10px;
-            border: 1px solid #ddd;
+            border: 1px solid var(--border);
+            background: #fff;
+            color: var(--text);
             margin-top: 4px;
+            outline: none;
+        }
+
+        input::placeholder {
+            color: rgba(107, 114, 128, 0.8);
+        }
+
+        input:focus {
+            border-color: rgba(37, 99, 235, 0.7);
+            box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12);
         }
 
         .pill {
@@ -41,29 +111,55 @@
             padding: 3px 8px;
             border-radius: 999px;
             font-size: 12px;
-            border: 1px solid #ddd;
+            border: 1px solid var(--border);
+            background: #fff;
         }
 
         .pill.online {
-            background: #e8fff1;
-            border-color: #b8f0cf;
+            background: rgba(22, 163, 74, 0.12);
+            border-color: rgba(22, 163, 74, 0.25);
         }
 
         .pill.offline {
-            background: #fff3f3;
-            border-color: #f0b8b8;
+            background: rgba(220, 38, 38, 0.10);
+            border-color: rgba(220, 38, 38, 0.25);
+        }
+
+        .panel {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            box-shadow: var(--shadow);
+        }
+
+        .panel-header {
+            padding: 14px 14px 10px 14px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            display: flex;
+            align-items: flex-end;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .panel-title {
+            font-size: 13px;
+            color: var(--muted);
+        }
+
+        .panel-body {
+            padding: 14px;
         }
 
         table {
             width: 100%;
             border-collapse: collapse;
-            margin-top: 14px;
         }
 
         th,
         td {
-            border-bottom: 1px solid #eee;
-            padding: 10px;
+            border-bottom: 1px solid var(--border);
+            padding: 12px 10px;
             vertical-align: top;
             text-align: left;
             font-size: 14px;
@@ -73,17 +169,66 @@
             font-size: 12px;
             text-transform: uppercase;
             letter-spacing: 0.06em;
-            color: #666;
+            color: rgba(17, 24, 39, 0.6);
         }
 
         pre {
             margin: 0;
-            background: #fafafa;
-            border: 1px solid #eee;
+            background: #f9fafb;
+            border: 1px solid var(--border);
             padding: 8px;
             border-radius: 8px;
             overflow: auto;
             max-height: 160px;
+            color: rgba(17, 24, 39, 0.92);
+        }
+
+        code {
+            font-family: var(--mono);
+            font-size: 12px;
+            color: rgba(17, 24, 39, 0.85);
+        }
+
+        tbody tr:hover td {
+            background: rgba(37, 99, 235, 0.04);
+        }
+
+        .battery {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            min-width: 120px;
+        }
+
+        .battery-bar {
+            height: 8px;
+            border-radius: 999px;
+            background: #eef2ff;
+            border: 1px solid rgba(37, 99, 235, 0.12);
+            overflow: hidden;
+        }
+
+        .battery-fill {
+            height: 100%;
+            background: linear-gradient(90deg, rgba(37, 99, 235, 0.95), rgba(22, 163, 74, 0.95));
+            width: 0%;
+        }
+
+        .battery-fill.low {
+            background: linear-gradient(90deg, rgba(245, 158, 11, 0.95), rgba(220, 38, 38, 0.95));
+        }
+
+        .battery-label {
+            font-size: 12px;
+            color: rgba(17, 24, 39, 0.6);
+        }
+
+        .mini-map {
+            width: 64px;
+            height: 64px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            background: #fff;
         }
 
         /* Modal */
@@ -101,9 +246,9 @@
             width: min(680px, 100%);
             background: #fff;
             border-radius: 14px;
-            border: 1px solid #e7e7e7;
+            border: 1px solid var(--border);
             padding: 16px;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+            box-shadow: var(--shadow);
         }
 
         .modal h2 {
@@ -111,7 +256,7 @@
         }
 
         .modal .hint {
-            color: #666;
+            color: rgba(17, 24, 39, 0.55);
             font-size: 13px;
             margin-top: 6px;
         }
@@ -120,15 +265,11 @@
             display: block;
             font-size: 13px;
             margin-top: 10px;
-            color: #333;
+            color: rgba(17, 24, 39, 0.85);
         }
 
         .modal input {
             width: 100%;
-            box-sizing: border-box;
-            padding: 10px;
-            border-radius: 10px;
-            border: 1px solid #ddd;
             margin-top: 4px;
         }
 
@@ -140,18 +281,19 @@
         }
 
         .warn {
-            background: #fff7e6;
-            border: 1px solid #ffe3ad;
+            background: rgba(245, 158, 11, 0.14);
+            border: 1px solid rgba(245, 158, 11, 0.28);
             border-radius: 10px;
             padding: 10px;
             margin-top: 10px;
             font-size: 13px;
+            color: rgba(17, 24, 39, 0.9);
         }
 
         .status-line {
             margin-top: 10px;
             font-size: 13px;
-            color: #333;
+            color: rgba(17, 24, 39, 0.9);
         }
 
         .split {
@@ -169,7 +311,7 @@
         canvas {
             width: 100%;
             height: 160px;
-            border: 1px solid #eee;
+            border: 1px solid var(--border);
             border-radius: 10px;
             background: #fff;
         }
@@ -177,43 +319,66 @@
 </head>
 
 <body>
-    <div class="row">
-        <h1 style="margin:0;">📡 Base Station Dashboard</h1>
-        <button onclick="startPairing()">Add Device</button>
-        <span class="pill" id="pollPill">Polling…</span>
-    </div>
-
-    <div class="warn" style="margin-top:12px;">
-        <div style="font-weight:bold;margin-bottom:6px;">Dog Tracker Demo Controls (pushes config to devices)</div>
-        <div class="row" style="gap:10px;">
-            <div>
-                <div style="font-size:12px;color:#555;">Center Lat</div>
-                <input id="cfgCenterLat" style="width:160px;" />
+    <div class="container">
+        <div class="topbar">
+            <div class="title">
+                <h1>📡 Base Station</h1>
+                <div class="subtitle">Dog tracker demo (local-only)</div>
             </div>
-            <div>
-                <div style="font-size:12px;color:#555;">Center Lng</div>
-                <input id="cfgCenterLng" style="width:160px;" />
+            <div class="row">
+                <input id="searchBox" placeholder="Search name or device_id…" style="width:260px;margin-top:0;" />
+                <button class="primary" onclick="startPairing()">Add Device</button>
+                <span class="pill" id="pollPill">Polling…</span>
             </div>
-            <div>
-                <div style="font-size:12px;color:#555;">Radius (m)</div>
-                <input id="cfgRadiusM" style="width:120px;" />
-            </div>
-            <div>
-                <div style="font-size:12px;color:#555;">Battery Drain / Update</div>
-                <input id="cfgBatteryDrain" style="width:170px;" />
-            </div>
-            <div style="display:flex;align-items:flex-end;gap:8px;">
-                <label style="font-size:13px;user-select:none;">
-                    <input type="checkbox" id="cfgBatteryLoop" /> Loop battery (0 → 100)
-                </label>
-            </div>
-            <button onclick="saveConfig()">Save Controls</button>
-            <span id="cfgStatus" style="font-size:13px;color:#333;"></span>
         </div>
-        <div class="hint">These settings sync to devices on the next <code>POST /data</code>.</div>
-    </div>
 
-    <table>
+        <div class="panel" style="margin-top:12px;">
+            <div class="panel-header">
+                <div>
+                    <div class="panel-title">Demo Controls</div>
+                    <div class="subtitle">Syncs to devices on next <code style="font-family:var(--mono);">POST /data</code>
+                    </div>
+                </div>
+                <div class="row" style="gap:10px;">
+                    <button onclick="loadConfigIntoControls()">Reload</button>
+                    <button class="primary" onclick="saveConfig()">Save</button>
+                    <span id="cfgStatus" class="subtitle"></span>
+                </div>
+            </div>
+            <div class="panel-body">
+                <div class="row" style="gap:12px;">
+                    <div>
+                        <div style="font-size:12px;color:var(--muted);">Center Lat</div>
+                        <input id="cfgCenterLat" style="width:160px;" />
+                    </div>
+                    <div>
+                        <div style="font-size:12px;color:var(--muted);">Center Lng</div>
+                        <input id="cfgCenterLng" style="width:160px;" />
+                    </div>
+                    <div>
+                        <div style="font-size:12px;color:var(--muted);">Radius (m)</div>
+                        <input id="cfgRadiusM" style="width:140px;" />
+                    </div>
+                    <div>
+                        <div style="font-size:12px;color:var(--muted);">Battery Drain / Update</div>
+                        <input id="cfgBatteryDrain" style="width:180px;" />
+                    </div>
+                    <div style="display:flex;align-items:flex-end;gap:8px;">
+                        <label style="font-size:13px;user-select:none;color:rgba(229,231,235,0.9);">
+                            <input type="checkbox" id="cfgBatteryLoop" /> Loop battery (0 → 100)
+                        </label>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" style="margin-top:12px;">
+            <div class="panel-header">
+                <div class="panel-title">Devices</div>
+                <div class="subtitle" id="deviceCount"></div>
+            </div>
+            <div class="panel-body" style="padding:0;">
+                <table>
         <thead>
             <tr>
                 <th>Name</th>
@@ -230,23 +395,27 @@
                 <td colspan="7">No devices yet…</td>
             </tr>
         </tbody>
-    </table>
+                </table>
+            </div>
+        </div>
+
+    </div>
 
     <div class="modal-backdrop" id="historyBackdrop" role="dialog" aria-modal="true">
         <div class="modal">
             <div class="row" style="justify-content:space-between;">
                 <h2 style="margin:0;">Device History</h2>
-                <button onclick="closeHistory()">Close</button>
+                <button class="primary" onclick="closeHistory()">Close</button>
             </div>
             <div class="hint" id="historyTitle"></div>
 
             <div class="split" style="margin-top:12px;">
                 <div>
-                    <div style="font-size:12px;color:#555;margin-bottom:6px;">Battery (%)</div>
+                    <div style="font-size:12px;color:var(--muted);margin-bottom:6px;">Battery (%)</div>
                     <canvas id="batteryCanvas" width="600" height="160"></canvas>
                 </div>
                 <div>
-                    <div style="font-size:12px;color:#555;margin-bottom:6px;">Last Points</div>
+                    <div style="font-size:12px;color:var(--muted);margin-bottom:6px;">Last Points</div>
                     <pre id="historyPre" style="max-height:180px;"></pre>
                 </div>
             </div>
@@ -285,18 +454,31 @@
             <div class="status-line" id="pairingStatus"></div>
             <div class="actions">
                 <button onclick="closePairing()">Cancel</button>
-                <button onclick="continuePairing()">Continue</button>
+                <button class="primary" onclick="continuePairing()">Continue</button>
             </div>
         </div>
     </div>
 
     <script>
         const HEARTBEAT_TIMEOUT_S = 10;
+        let currentConfig = null;
+        let lastDevices = [];
 
         function fmtLastSeen(tsSeconds) {
             if (!tsSeconds) return "—";
             const d = new Date(tsSeconds * 1000);
             return d.toLocaleString();
+        }
+
+        function fmtAge(ageSeconds) {
+            const s = Number(ageSeconds);
+            if (!Number.isFinite(s)) return "—";
+            if (s < 1) return "just now";
+            if (s < 60) return `${Math.round(s)}s ago`;
+            const m = s / 60;
+            if (m < 60) return `${Math.round(m)}m ago`;
+            const h = m / 60;
+            return `${Math.round(h)}h ago`;
         }
 
         function prettyJson(obj) {
@@ -338,13 +520,89 @@
             return `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
         }
 
+        function clamp(v, lo, hi) {
+            return Math.max(lo, Math.min(hi, v));
+        }
+
+        function gpsToXYm(gps, cfg) {
+            if (!gps || typeof gps !== "object" || !cfg) return null;
+            const lat = Number(gps.lat);
+            const lng = Number(gps.lng);
+            if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+
+            const center = cfg.gps_center || {};
+            const clat = Number(center.lat);
+            const clng = Number(center.lng);
+            const radiusM = Number(cfg.gps_radius_m);
+            if (!Number.isFinite(clat) || !Number.isFinite(clng) || !Number.isFinite(radiusM) || radiusM <= 0) return null;
+
+            const latRad = (clat * Math.PI) / 180;
+            const metersPerDegLat = 111320.0;
+            const metersPerDegLng = 111320.0 * Math.cos(latRad);
+            const dLatM = (lat - clat) * metersPerDegLat;
+            const dLngM = (lng - clng) * (metersPerDegLng || 1);
+            return { dLatM, dLngM, radiusM };
+        }
+
+        function renderMiniMap(gps) {
+            const cfg = currentConfig;
+            const p = gpsToXYm(gps, cfg);
+            const size = 64;
+            const r = 28;
+            let x = size / 2;
+            let y = size / 2;
+            let ok = false;
+            if (p) {
+                const nx = clamp(p.dLngM / p.radiusM, -1, 1);
+                const ny = clamp(p.dLatM / p.radiusM, -1, 1);
+                x = size / 2 + nx * r;
+                y = size / 2 - ny * r;
+                ok = true;
+            }
+            const dot = ok ? `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3.5" fill="rgba(37,99,235,0.95)"/>` :
+                `<text x="32" y="36" font-size="10" text-anchor="middle" fill="rgba(17,24,39,0.45)">no gps</text>`;
+            return `
+                <svg class="mini-map" viewBox="0 0 64 64" aria-label="gps map">
+                    <circle cx="32" cy="32" r="28" fill="rgba(37,99,235,0.04)" stroke="rgba(17,24,39,0.12)" />
+                    <line x1="32" y1="6" x2="32" y2="58" stroke="rgba(17,24,39,0.10)" />
+                    <line x1="6" y1="32" x2="58" y2="32" stroke="rgba(17,24,39,0.10)" />
+                    ${dot}
+                </svg>
+            `;
+        }
+
+        function renderBatteryCell(v) {
+            if (v === null || v === undefined) {
+                return `<div class="battery"><div class="battery-label">—</div></div>`;
+            }
+            const n = clamp(Math.round(Number(v)), 0, 100);
+            const low = n <= 20 ? "low" : "";
+            return `
+                <div class="battery">
+                    <div class="battery-bar"><div class="battery-fill ${low}" style="width:${n}%"></div></div>
+                    <div class="battery-label">${n}%</div>
+                </div>
+            `;
+        }
+
         function renderDevices(devices) {
+            lastDevices = devices || [];
+            const q = (document.getElementById("searchBox")?.value || "").trim().toLowerCase();
+            const filtered = q ? lastDevices.filter(d => {
+                const name = (d.name || "").toString().toLowerCase();
+                const id = (d.device_id || "").toString().toLowerCase();
+                return name.includes(q) || id.includes(q);
+            }) : lastDevices;
+
+            const countEl = document.getElementById("deviceCount");
+            if (countEl) countEl.textContent = q ? `${filtered.length} / ${lastDevices.length}` : `${lastDevices.length}`;
+
             const tbody = document.getElementById("deviceTbody");
-            if (!devices.length) {
+            if (!filtered.length) {
                 tbody.innerHTML = `<tr><td colspan="7">No devices yet…</td></tr>`;
                 return;
             }
-            tbody.innerHTML = devices.map(d => {
+            tbody.innerHTML = filtered.map(d => {
                 const statusClass = d.status === "online" ? "online" : "offline";
                 const statusLabel = d.status === "online" ? "online" : "offline";
                 const battery = d.data ? d.data.battery : undefined;
@@ -353,12 +611,18 @@
                     <tr>
                         <td>
                             <div style="font-weight:bold;">${(d.name || "").toString()}</div>
-                            <div style="font-size:12px;color:#666;"><code>${d.device_id}</code></div>
+                            <div class="muted" style="font-size:12px;"><code>${d.device_id}</code></div>
                         </td>
                         <td><span class="pill ${statusClass}">${statusLabel}</span></td>
-                        <td>${fmtLastSeen(d.last_seen)}</td>
-                        <td>${fmtBattery(battery)}</td>
-                        <td>${fmtGps(gps)}</td>
+                        <td>
+                            <div>${fmtAge(d.age_s)}</div>
+                            <div class="muted" style="font-size:12px;" title="${fmtLastSeen(d.last_seen)}">${fmtLastSeen(d.last_seen)}</div>
+                        </td>
+                        <td>${renderBatteryCell(battery)}</td>
+                        <td>
+                            <div class="muted" style="font-size:12px;margin-bottom:6px;">${fmtGps(gps)}</div>
+                            ${renderMiniMap(gps)}
+                        </td>
                         <td><button class="histBtn" data-id="${d.device_id}" data-name="${(d.name || "").toString().replace(/\"/g, '&quot;')}">History</button></td>
                         <td><pre>${prettyJson(d.data)}</pre></td>
                     </tr>
@@ -488,6 +752,7 @@
         async function loadConfigIntoControls() {
             try {
                 const cfg = await fetchConfig();
+                currentConfig = cfg;
                 const center = cfg.gps_center || {};
                 document.getElementById("cfgCenterLat").value = (center.lat ?? "").toString();
                 document.getElementById("cfgCenterLng").value = (center.lng ?? "").toString();
@@ -495,6 +760,7 @@
                 document.getElementById("cfgBatteryDrain").value = (cfg.battery_drain ?? "").toString();
                 document.getElementById("cfgBatteryLoop").checked = !!cfg.battery_loop;
                 document.getElementById("cfgStatus").textContent = "";
+                if (lastDevices.length) renderDevices(lastDevices);
             } catch (_) {
                 document.getElementById("cfgStatus").textContent = "Failed to load controls.";
             }
@@ -529,7 +795,10 @@
                     })
                 });
                 if (!resp.ok) throw new Error("save_failed");
+                const j = await resp.json();
+                currentConfig = j.config || currentConfig;
                 status.textContent = "Saved.";
+                if (lastDevices.length) renderDevices(lastDevices);
             } catch (_) {
                 status.textContent = "Save failed.";
             }
@@ -603,6 +872,26 @@
             const btn = e.target.closest(".histBtn");
             if (!btn) return;
             openHistory(btn.dataset.id, btn.dataset.name);
+        });
+
+        // search filter
+        document.getElementById("searchBox").addEventListener("input", () => {
+            renderDevices(lastDevices);
+        });
+
+        // esc to close modals
+        document.addEventListener("keydown", (e) => {
+            if (e.key !== "Escape") return;
+            closePairing();
+            closeHistory();
+        });
+
+        // click backdrop to close
+        document.getElementById("pairingBackdrop").addEventListener("click", (e) => {
+            if (e.target.id === "pairingBackdrop") closePairing();
+        });
+        document.getElementById("historyBackdrop").addEventListener("click", (e) => {
+            if (e.target.id === "historyBackdrop") closeHistory();
         });
     </script>
 </body>
