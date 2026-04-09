@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 import time
+from pathlib import Path
 from typing import Any
 
 from flask import Flask, jsonify, render_template, request
@@ -8,16 +11,7 @@ from flask import Flask, jsonify, render_template, request
 app = Flask(__name__)
 
 HEARTBEAT_TIMEOUT_S = 10
-
-# In-memory registry:
-# devices = {
-#   device_id: {
-#     "last_seen": <unix_ts_float>,
-#     "data": <payload_dict>,
-#     "name": <display_name_str>
-#   }
-# }
-devices: dict[str, dict[str, Any]] = {}
+DB_PATH = Path(__file__).resolve().with_name("basestation.db")
 
 # Global mock config pushed down to devices (dog tracker demo).
 server_config: dict[str, Any] = {
@@ -47,6 +41,84 @@ def _coerce_int(v: Any, default: int) -> int:
         return default
 
 
+def _db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
+
+
+def _init_db() -> None:
+    with _db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS devices (
+                device_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                first_seen REAL NOT NULL,
+                last_seen REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS readings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                ts REAL NOT NULL,
+                status TEXT,
+                battery INTEGER,
+                lat REAL,
+                lng REAL,
+                raw_json TEXT NOT NULL,
+                FOREIGN KEY(device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_readings_device_ts
+            ON readings(device_id, ts DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kv (
+                k TEXT PRIMARY KEY,
+                v TEXT NOT NULL
+            )
+            """
+        )
+
+
+def _load_server_config() -> None:
+    global server_config
+    with _db() as conn:
+        row = conn.execute("SELECT v FROM kv WHERE k = ?", ("server_config",)).fetchone()
+        if not row:
+            return
+        try:
+            loaded = json.loads(row["v"])
+            if isinstance(loaded, dict):
+                server_config.update(loaded)
+        except Exception:
+            return
+
+
+def _save_server_config() -> None:
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO kv(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            ("server_config", json.dumps(server_config)),
+        )
+
+
+# Ensure DB is ready even when imported (e.g., tests / Flask reloader).
+_init_db()
+_load_server_config()
+
+
 def _device_view(device_id: str, entry: dict[str, Any]) -> dict[str, Any]:
     last_seen = float(entry.get("last_seen", 0.0))
     data = entry.get("data") or {}
@@ -74,9 +146,41 @@ def index() -> str:
 
 @app.get("/devices")
 def list_devices():
-    view = [_device_view(did, entry) for did, entry in devices.items()]
-    view.sort(key=lambda d: d.get("last_seen") or 0.0, reverse=True)
-    return jsonify({"devices": view})
+    with _db() as conn:
+        rows = conn.execute(
+            """
+            SELECT d.device_id, d.name, d.last_seen,
+                   r.raw_json AS raw_json
+            FROM devices d
+            LEFT JOIN readings r
+              ON r.id = (
+                SELECT id FROM readings
+                WHERE device_id = d.device_id
+                ORDER BY ts DESC
+                LIMIT 1
+              )
+            ORDER BY d.last_seen DESC
+            """
+        ).fetchall()
+
+    devices_view: list[dict[str, Any]] = []
+    for row in rows:
+        payload: dict[str, Any] = {}
+        if row["raw_json"]:
+            try:
+                parsed = json.loads(row["raw_json"])
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except Exception:
+                payload = {}
+        devices_view.append(
+            _device_view(
+                row["device_id"],
+                {"last_seen": float(row["last_seen"]), "data": payload, "name": row["name"]},
+            )
+        )
+
+    return jsonify({"devices": devices_view})
 
 
 @app.get("/config")
@@ -110,6 +214,7 @@ def set_config():
     )
     server_config["battery_loop"] = bool(cfg.get("battery_loop", server_config["battery_loop"]))
 
+    _save_server_config()
     return jsonify({"status": "ok", "config": server_config})
 
 
@@ -126,12 +231,116 @@ def receive_data():
     # Backward compatible: name/gps/battery may be missing.
     incoming_name = str(data.get("name") or "").strip()
 
-    existing = devices.get(device_id) or {}
-    stored_name = str(existing.get("name") or "").strip()
-    name = incoming_name or stored_name or _default_name(device_id)
+    now = time.time()
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT name FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        stored_name = str(row["name"]).strip() if row else ""
+        name = incoming_name or stored_name or _default_name(device_id)
 
-    devices[device_id] = {"last_seen": time.time(), "data": data, "name": name}
+        # Upsert device.
+        if row:
+            conn.execute(
+                "UPDATE devices SET name = ?, last_seen = ? WHERE device_id = ?",
+                (name, now, device_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO devices(device_id, name, first_seen, last_seen) VALUES(?, ?, ?, ?)",
+                (device_id, name, now, now),
+            )
+
+        gps = data.get("gps") if isinstance(data.get("gps"), dict) else {}
+        lat = gps.get("lat")
+        lng = gps.get("lng")
+        try:
+            lat_f = float(lat) if lat is not None else None
+        except Exception:
+            lat_f = None
+        try:
+            lng_f = float(lng) if lng is not None else None
+        except Exception:
+            lng_f = None
+
+        battery = data.get("battery")
+        try:
+            battery_i = int(battery) if battery is not None else None
+        except Exception:
+            battery_i = None
+
+        status = data.get("status")
+        status_s = str(status) if status is not None else None
+
+        conn.execute(
+            """
+            INSERT INTO readings(device_id, ts, status, battery, lat, lng, raw_json)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            (device_id, now, status_s, battery_i, lat_f, lng_f, json.dumps(data)),
+        )
+
     return jsonify({"status": "ok", "config": server_config})
+
+
+@app.get("/history/<device_id>")
+def history(device_id: str):
+    limit = request.args.get("limit", "200")
+    try:
+        limit_i = max(1, min(2000, int(limit)))
+    except Exception:
+        limit_i = 200
+
+    with _db() as conn:
+        rows = conn.execute(
+            """
+            SELECT ts, status, battery, lat, lng, raw_json
+            FROM readings
+            WHERE device_id = ?
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            (device_id, limit_i),
+        ).fetchall()
+
+        drow = conn.execute(
+            "SELECT device_id, name, first_seen, last_seen FROM devices WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+
+    if not drow:
+        return jsonify({"status": "error", "error": "not_found"}), 404
+
+    points: list[dict[str, Any]] = []
+    for r in rows:
+        payload: dict[str, Any] = {}
+        try:
+            payload = json.loads(r["raw_json"])
+        except Exception:
+            payload = {}
+        points.append(
+            {
+                "ts": float(r["ts"]),
+                "status": r["status"],
+                "battery": r["battery"],
+                "lat": r["lat"],
+                "lng": r["lng"],
+                "data": payload,
+            }
+        )
+
+    points.reverse()
+    return jsonify(
+        {
+            "device": {
+                "device_id": drow["device_id"],
+                "name": drow["name"],
+                "first_seen": float(drow["first_seen"]),
+                "last_seen": float(drow["last_seen"]),
+            },
+            "points": points,
+        }
+    )
 
 
 if __name__ == "__main__":
