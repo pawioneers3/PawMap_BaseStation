@@ -57,7 +57,7 @@ Install in Arduino IDE (Library Manager):
 
 ### Flash
 Open this file in Arduino IDE and upload:
-- `/Users/macbookair/thesis/basestation_flask/ESP32_Pairing.ino`
+- `/Users/macbookair/thesis/basestation_flask/ESP32_Pairing/ESP32_Pairing.ino`
 
 ## 3) “Add Device” / Provisioning Flow
 
@@ -79,8 +79,8 @@ This is the intended pairing UX:
 8. ESP32 joins your WiFi and starts posting to the base station → device appears in the dashboard
 
 ### Re-provision / change WiFi
-- Hold the ESP32 **BOOT** button (GPIO0) during power-on for ~1 second to clear stored config (NVS).
-- Then repeat the “Add Device” flow.
+- Press and hold the ESP32 **BOOT** button (GPIO0) for ~2–3 seconds while it is running to clear stored config (NVS).
+- The ESP32 will restart into Setup Mode; then repeat the “Add Device” flow.
 
 ## 4) Dog Tracker Demo Controls
 
@@ -91,4 +91,3 @@ On the dashboard, you can set:
 - Battery looping behavior
 
 These settings are saved server-side and returned to devices on the next `POST /data`.
-

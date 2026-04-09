@@ -10,6 +10,7 @@ static const int RESET_BUTTON_PIN = 0; // BOOT button on many ESP32 DevKit V1 bo
 static const unsigned long POST_INTERVAL_MS = 5000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 5000;
 static const unsigned long WIFI_GIVEUP_MS = 30000;
+static const unsigned long RESET_HOLD_MS = 2500;
 
 // ----- NVS keys -----
 static const char *PREF_NS = "cfg";
@@ -52,6 +53,8 @@ float gpsLng = 0.0f;
 bool gpsInited = false;
 int batteryPct = 100;
 bool batteryInited = false;
+
+unsigned long resetHoldStartMs = 0;
 
 static void sendCorsHeaders() {
   web.sendHeader("Access-Control-Allow-Origin", "*");
@@ -432,6 +435,27 @@ static void maybeClearConfigOnBoot() {
   }
 }
 
+static void checkResetButtonLongPress() {
+  // Using BOOT (GPIO0) as "held-on-boot" is unreliable because holding it during reset
+  // enters the ROM serial bootloader ("waiting for download"). Instead, support a
+  // runtime long-press that works in normal execution.
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+  bool pressed = (digitalRead(RESET_BUTTON_PIN) == LOW);
+  unsigned long now = millis();
+
+  if (pressed) {
+    if (resetHoldStartMs == 0) resetHoldStartMs = now;
+    if (now - resetHoldStartMs >= RESET_HOLD_MS) {
+      Serial.println("[RESET] BOOT long-press detected. Clearing config...");
+      clearConfig();
+      delay(200);
+      ESP.restart();
+    }
+  } else {
+    resetHoldStartMs = 0;
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -452,6 +476,8 @@ void setup() {
 }
 
 void loop() {
+  checkResetButtonLongPress();
+
   if (mode == MODE_SETUP) {
     web.handleClient();
     delay(2);
