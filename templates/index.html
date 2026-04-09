@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Base Station</title>
+    <style>
+        body {
+            font-family: Arial;
+            padding: 20px;
+        }
+
+        .row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            padding: 10px 12px;
+            border-radius: 8px;
+            border: 1px solid #ddd;
+            background: #f7f7f7;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background: #efefef;
+        }
+
+        input {
+            box-sizing: border-box;
+            padding: 10px;
+            border-radius: 10px;
+            border: 1px solid #ddd;
+            margin-top: 4px;
+        }
+
+        .pill {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 999px;
+            font-size: 12px;
+            border: 1px solid #ddd;
+        }
+
+        .pill.online {
+            background: #e8fff1;
+            border-color: #b8f0cf;
+        }
+
+        .pill.offline {
+            background: #fff3f3;
+            border-color: #f0b8b8;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 14px;
+        }
+
+        th,
+        td {
+            border-bottom: 1px solid #eee;
+            padding: 10px;
+            vertical-align: top;
+            text-align: left;
+            font-size: 14px;
+        }
+
+        th {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: #666;
+        }
+
+        pre {
+            margin: 0;
+            background: #fafafa;
+            border: 1px solid #eee;
+            padding: 8px;
+            border-radius: 8px;
+            overflow: auto;
+            max-height: 160px;
+        }
+
+        /* Modal */
+        .modal-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.45);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .modal {
+            width: min(680px, 100%);
+            background: #fff;
+            border-radius: 14px;
+            border: 1px solid #e7e7e7;
+            padding: 16px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+        }
+
+        .modal h2 {
+            margin: 0 0 10px 0;
+        }
+
+        .modal .hint {
+            color: #666;
+            font-size: 13px;
+            margin-top: 6px;
+        }
+
+        .modal label {
+            display: block;
+            font-size: 13px;
+            margin-top: 10px;
+            color: #333;
+        }
+
+        .modal input {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 10px;
+            border-radius: 10px;
+            border: 1px solid #ddd;
+            margin-top: 4px;
+        }
+
+        .modal .actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            margin-top: 14px;
+        }
+
+        .warn {
+            background: #fff7e6;
+            border: 1px solid #ffe3ad;
+            border-radius: 10px;
+            padding: 10px;
+            margin-top: 10px;
+            font-size: 13px;
+        }
+
+        .status-line {
+            margin-top: 10px;
+            font-size: 13px;
+            color: #333;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="row">
+        <h1 style="margin:0;">📡 Base Station Dashboard</h1>
+        <button onclick="startPairing()">Add Device</button>
+        <span class="pill" id="pollPill">Polling…</span>
+    </div>
+
+    <div class="warn" style="margin-top:12px;">
+        <div style="font-weight:bold;margin-bottom:6px;">Dog Tracker Demo Controls (pushes config to devices)</div>
+        <div class="row" style="gap:10px;">
+            <div>
+                <div style="font-size:12px;color:#555;">Center Lat</div>
+                <input id="cfgCenterLat" style="width:160px;" />
+            </div>
+            <div>
+                <div style="font-size:12px;color:#555;">Center Lng</div>
+                <input id="cfgCenterLng" style="width:160px;" />
+            </div>
+            <div>
+                <div style="font-size:12px;color:#555;">Radius (m)</div>
+                <input id="cfgRadiusM" style="width:120px;" />
+            </div>
+            <div>
+                <div style="font-size:12px;color:#555;">Battery Drain / Update</div>
+                <input id="cfgBatteryDrain" style="width:170px;" />
+            </div>
+            <div style="display:flex;align-items:flex-end;gap:8px;">
+                <label style="font-size:13px;user-select:none;">
+                    <input type="checkbox" id="cfgBatteryLoop" /> Loop battery (0 → 100)
+                </label>
+            </div>
+            <button onclick="saveConfig()">Save Controls</button>
+            <span id="cfgStatus" style="font-size:13px;color:#333;"></span>
+        </div>
+        <div class="hint">These settings sync to devices on the next <code>POST /data</code>.</div>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>Status</th>
+                <th>Last Seen</th>
+                <th>Battery</th>
+                <th>GPS</th>
+                <th>Payload</th>
+            </tr>
+        </thead>
+        <tbody id="deviceTbody">
+            <tr>
+                <td colspan="6">No devices yet…</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="modal-backdrop" id="pairingBackdrop" role="dialog" aria-modal="true">
+        <div class="modal">
+            <h2>Add Device (SoftAP Provisioning)</h2>
+            <ol style="margin: 8px 0 0 18px; padding: 0;">
+                <li>Power on your ESP32.</li>
+                <li>On your computer, connect to WiFi: <b>ESP32-XXXX</b> (shown by the device).</li>
+                <li>Return to this page and click <b>Continue</b>.</li>
+                <li>After sending setup, your ESP32 will reboot and join your WiFi; your computer may also switch
+                    back—this page will keep waiting.</li>
+            </ol>
+
+            <div class="warn" id="localWarn" style="display:none;">
+                You opened the dashboard using <b>localhost</b>. Your ESP32 cannot reach <b>localhost</b>.<br />
+                Use your LAN IP (example: <code>192.168.1.10</code>) for <b>Base Station IP</b>.
+            </div>
+
+            <label>WiFi SSID</label>
+            <input id="wifiSsid" placeholder="Your WiFi name" />
+
+            <label>WiFi Password</label>
+            <input id="wifiPassword" placeholder="Your WiFi password" type="password" />
+
+            <label>Device Name (optional)</label>
+            <input id="deviceName" placeholder="e.g. Brownie (leave blank to auto-generate)" />
+
+            <label>Base Station IP</label>
+            <input id="serverIp" placeholder="e.g. 192.168.1.10" value="{{ server_ip }}" />
+            <div class="hint">Tip: This must be reachable from the ESP32 on your WiFi.</div>
+
+            <div class="status-line" id="pairingStatus"></div>
+            <div class="actions">
+                <button onclick="closePairing()">Cancel</button>
+                <button onclick="continuePairing()">Continue</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const HEARTBEAT_TIMEOUT_S = 10;
+
+        function fmtLastSeen(tsSeconds) {
+            if (!tsSeconds) return "—";
+            const d = new Date(tsSeconds * 1000);
+            return d.toLocaleString();
+        }
+
+        function prettyJson(obj) {
+            try { return JSON.stringify(obj, null, 2); } catch (_) { return String(obj); }
+        }
+
+        function setPollPill(ok) {
+            const pill = document.getElementById("pollPill");
+            pill.textContent = ok ? "Live" : "Disconnected";
+            pill.className = "pill " + (ok ? "online" : "offline");
+        }
+
+        async function fetchDevices() {
+            const resp = await fetch("/devices", { cache: "no-store" });
+            if (!resp.ok) throw new Error("devices_fetch_failed");
+            const payload = await resp.json();
+            return payload.devices || [];
+        }
+
+        async function fetchConfig() {
+            const resp = await fetch("/config", { cache: "no-store" });
+            if (!resp.ok) throw new Error("config_fetch_failed");
+            const payload = await resp.json();
+            return payload.config || {};
+        }
+
+        function fmtBattery(v) {
+            if (v === null || v === undefined) return "—";
+            const n = Number(v);
+            if (!Number.isFinite(n)) return "—";
+            return `${Math.max(0, Math.min(100, Math.round(n)))}%`;
+        }
+
+        function fmtGps(gps) {
+            if (!gps || typeof gps !== "object") return "—";
+            const lat = Number(gps.lat);
+            const lng = Number(gps.lng);
+            if (!Number.isFinite(lat) || !Number.isFinite(lng)) return "—";
+            return `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+        }
+
+        function renderDevices(devices) {
+            const tbody = document.getElementById("deviceTbody");
+            if (!devices.length) {
+                tbody.innerHTML = `<tr><td colspan="6">No devices yet…</td></tr>`;
+                return;
+            }
+            tbody.innerHTML = devices.map(d => {
+                const statusClass = d.status === "online" ? "online" : "offline";
+                const statusLabel = d.status === "online" ? "online" : "offline";
+                const battery = d.data ? d.data.battery : undefined;
+                const gps = d.data ? d.data.gps : undefined;
+                return `
+                    <tr>
+                        <td>
+                            <div style="font-weight:bold;">${(d.name || "").toString()}</div>
+                            <div style="font-size:12px;color:#666;"><code>${d.device_id}</code></div>
+                        </td>
+                        <td><span class="pill ${statusClass}">${statusLabel}</span></td>
+                        <td>${fmtLastSeen(d.last_seen)}</td>
+                        <td>${fmtBattery(battery)}</td>
+                        <td>${fmtGps(gps)}</td>
+                        <td><pre>${prettyJson(d.data)}</pre></td>
+                    </tr>
+                `;
+            }).join("");
+        }
+
+        let pollTimer = null;
+        async function pollLoop() {
+            try {
+                const devices = await fetchDevices();
+                renderDevices(devices);
+                setPollPill(true);
+            } catch (e) {
+                setPollPill(false);
+            }
+        }
+
+        function startPolling() {
+            if (pollTimer) clearInterval(pollTimer);
+            pollLoop();
+            pollTimer = setInterval(pollLoop, 2000);
+        }
+
+        // Pairing flow
+        function startPairing() {
+            const backdrop = document.getElementById("pairingBackdrop");
+            backdrop.style.display = "flex";
+            document.getElementById("pairingStatus").textContent = "";
+
+            const host = window.location.hostname;
+            const warn = document.getElementById("localWarn");
+            warn.style.display = (host === "localhost" || host === "127.0.0.1") ? "block" : "none";
+
+            // Prefill server IP if the user opened via an IP.
+            if (host && host !== "localhost" && host !== "127.0.0.1") {
+                document.getElementById("serverIp").value = host;
+            }
+        }
+
+        function closePairing() {
+            document.getElementById("pairingBackdrop").style.display = "none";
+        }
+
+        async function loadConfigIntoControls() {
+            try {
+                const cfg = await fetchConfig();
+                const center = cfg.gps_center || {};
+                document.getElementById("cfgCenterLat").value = (center.lat ?? "").toString();
+                document.getElementById("cfgCenterLng").value = (center.lng ?? "").toString();
+                document.getElementById("cfgRadiusM").value = (cfg.gps_radius_m ?? "").toString();
+                document.getElementById("cfgBatteryDrain").value = (cfg.battery_drain ?? "").toString();
+                document.getElementById("cfgBatteryLoop").checked = !!cfg.battery_loop;
+                document.getElementById("cfgStatus").textContent = "";
+            } catch (_) {
+                document.getElementById("cfgStatus").textContent = "Failed to load controls.";
+            }
+        }
+
+        async function saveConfig() {
+            const status = document.getElementById("cfgStatus");
+            status.textContent = "Saving…";
+
+            const lat = Number(document.getElementById("cfgCenterLat").value);
+            const lng = Number(document.getElementById("cfgCenterLng").value);
+            const radiusM = Number(document.getElementById("cfgRadiusM").value);
+            const drain = Number(document.getElementById("cfgBatteryDrain").value);
+            const loop = document.getElementById("cfgBatteryLoop").checked;
+
+            if (!Number.isFinite(lat) || !Number.isFinite(lng) || !Number.isFinite(radiusM) || !Number.isFinite(drain)) {
+                status.textContent = "Please enter valid numbers.";
+                return;
+            }
+
+            try {
+                const resp = await fetch("/config", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        config: {
+                            gps_center: { lat, lng },
+                            gps_radius_m: radiusM,
+                            battery_drain: Math.max(0, Math.round(drain)),
+                            battery_loop: loop,
+                        }
+                    })
+                });
+                if (!resp.ok) throw new Error("save_failed");
+                status.textContent = "Saved.";
+            } catch (_) {
+                status.textContent = "Save failed.";
+            }
+        }
+
+        async function continuePairing() {
+            const statusEl = document.getElementById("pairingStatus");
+            const ssid = document.getElementById("wifiSsid").value.trim();
+            const password = document.getElementById("wifiPassword").value;
+            const name = document.getElementById("deviceName").value.trim();
+            const serverIp = document.getElementById("serverIp").value.trim();
+
+            if (!ssid || !serverIp) {
+                statusEl.textContent = "Please fill WiFi SSID and Base Station IP.";
+                return;
+            }
+
+            statusEl.textContent = "Capturing current device list…";
+            let known = new Set();
+            try {
+                const before = await fetchDevices();
+                known = new Set(before.map(d => d.device_id));
+            } catch (_) {
+                // If you're currently on the ESP32 AP already, this fetch may fail. That's OK.
+            }
+
+            statusEl.textContent = "Sending setup to ESP32 (192.168.4.1)…";
+            try {
+                const resp = await fetch("http://192.168.4.1/setup", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ ssid, password, server_ip: serverIp, name }),
+                });
+                if (!resp.ok) throw new Error("setup_failed");
+            } catch (e) {
+                statusEl.textContent = "Failed to reach ESP32. Make sure you connected to WiFi ESP32-XXXX, then try again.";
+                return;
+            }
+
+            statusEl.textContent = "Setup sent. Waiting for device to appear… (switch back to your normal WiFi if needed)";
+
+            const startedAt = Date.now();
+            const timeoutMs = 60000;
+
+            while (Date.now() - startedAt < timeoutMs) {
+                try {
+                    const devices = await fetchDevices();
+                    renderDevices(devices);
+                    for (const d of devices) {
+                        if (!known.has(d.device_id)) {
+                            const display = d.name ? `${d.name} (${d.device_id})` : d.device_id;
+                            statusEl.textContent = `Paired successfully: ${display}`;
+                            setTimeout(closePairing, 800);
+                            return;
+                        }
+                    }
+                } catch (_) {
+                    // Base station unreachable (likely still on ESP32 AP). Keep waiting.
+                }
+                await new Promise(r => setTimeout(r, 2000));
+            }
+
+            statusEl.textContent = "Timed out waiting for the device. Check WiFi credentials and try again.";
+        }
+
+        loadConfigIntoControls();
+        startPolling();
+    </script>
+</body>
+
+</html>
