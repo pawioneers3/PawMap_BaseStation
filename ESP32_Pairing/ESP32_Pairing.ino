@@ -43,6 +43,12 @@ struct MockConfig {
   float centerLat = 14.5995f;
   float centerLng = 120.9842f;
   float radiusM = 150.0f;
+  bool useBbox = false;
+  float minLat = 0.0f;
+  float maxLat = 0.0f;
+  float minLng = 0.0f;
+  float maxLng = 0.0f;
+  bool forceOob = false;
   int batteryDrain = 1;
   bool batteryLoop = true;
 };
@@ -285,15 +291,34 @@ static float rand01() {
 
 static void initMockStateIfNeeded() {
   if (!gpsInited) {
-    float angle = rand01() * 6.2831853f;
-    float dist = sqrtf(rand01()) * mockCfg.radiusM;
-    float latRad = mockCfg.centerLat * 0.0174532925f;
-    float metersPerDegLat = 111320.0f;
-    float metersPerDegLng = 111320.0f * cosf(latRad);
-    float dLat = (cosf(angle) * dist) / metersPerDegLat;
-    float dLng = (sinf(angle) * dist) / (metersPerDegLng > 1.0f ? metersPerDegLng : 1.0f);
-    gpsLat = mockCfg.centerLat + dLat;
-    gpsLng = mockCfg.centerLng + dLng;
+    if (mockCfg.useBbox && mockCfg.maxLat > mockCfg.minLat && mockCfg.maxLng > mockCfg.minLng) {
+      float latSpan = mockCfg.maxLat - mockCfg.minLat;
+      float lngSpan = mockCfg.maxLng - mockCfg.minLng;
+
+      float lat = mockCfg.minLat + rand01() * latSpan;
+      float lng = mockCfg.minLng + rand01() * lngSpan;
+
+      if (mockCfg.forceOob) {
+        // Push to a deterministic outside strip for demo (north or south based on deviceId hash).
+        bool north = ((uint8_t)deviceId[deviceId.length() - 1]) & 1;
+        float marginLat = latSpan * 0.20f;
+        lat = north ? (mockCfg.maxLat + marginLat) : (mockCfg.minLat - marginLat);
+        lng = mockCfg.minLng + rand01() * lngSpan;
+      }
+
+      gpsLat = lat;
+      gpsLng = lng;
+    } else {
+      float angle = rand01() * 6.2831853f;
+      float dist = sqrtf(rand01()) * mockCfg.radiusM;
+      float latRad = mockCfg.centerLat * 0.0174532925f;
+      float metersPerDegLat = 111320.0f;
+      float metersPerDegLng = 111320.0f * cosf(latRad);
+      float dLat = (cosf(angle) * dist) / metersPerDegLat;
+      float dLng = (sinf(angle) * dist) / (metersPerDegLng > 1.0f ? metersPerDegLng : 1.0f);
+      gpsLat = mockCfg.centerLat + dLat;
+      gpsLng = mockCfg.centerLng + dLng;
+    }
     gpsInited = true;
   }
 
@@ -305,6 +330,53 @@ static void initMockStateIfNeeded() {
 
 static void stepMockGps() {
   initMockStateIfNeeded();
+
+  if (mockCfg.useBbox && mockCfg.maxLat > mockCfg.minLat && mockCfg.maxLng > mockCfg.minLng) {
+    float latSpan = mockCfg.maxLat - mockCfg.minLat;
+    float lngSpan = mockCfg.maxLng - mockCfg.minLng;
+
+    // Step size as a fraction of the box size (keeps motion visible but bounded).
+    float stepLat = (rand01() - 0.5f) * latSpan * 0.06f;
+    float stepLng = (rand01() - 0.5f) * lngSpan * 0.06f;
+    // Ensure it doesn't get too tiny for small spans.
+    if (fabsf(stepLat) < latSpan * 0.004f) stepLat = (rand01() < 0.5f ? -1.0f : 1.0f) * latSpan * 0.004f;
+    if (fabsf(stepLng) < lngSpan * 0.004f) stepLng = (rand01() < 0.5f ? -1.0f : 1.0f) * lngSpan * 0.004f;
+
+    gpsLat += stepLat;
+    gpsLng += stepLng;
+
+    if (mockCfg.forceOob) {
+      // Keep outside the bbox but still moving (stick to outside strip beyond north/south edge).
+      bool north = ((uint8_t)deviceId[deviceId.length() - 1]) & 1;
+      float marginLat = latSpan * 0.20f;
+      float oobMinLat = north ? (mockCfg.maxLat + marginLat * 0.30f) : (mockCfg.minLat - marginLat);
+      float oobMaxLat = north ? (mockCfg.maxLat + marginLat) : (mockCfg.minLat - marginLat * 0.30f);
+
+      // Clamp to strip.
+      if (gpsLat < oobMinLat) gpsLat = oobMinLat;
+      if (gpsLat > oobMaxLat) gpsLat = oobMaxLat;
+
+      // Lng still walks but stays within bbox range.
+      if (gpsLng < mockCfg.minLng) gpsLng = mockCfg.minLng + (mockCfg.minLng - gpsLng);
+      if (gpsLng > mockCfg.maxLng) gpsLng = mockCfg.maxLng - (gpsLng - mockCfg.maxLng);
+      if (gpsLng < mockCfg.minLng) gpsLng = mockCfg.minLng;
+      if (gpsLng > mockCfg.maxLng) gpsLng = mockCfg.maxLng;
+      return;
+    }
+
+    // Normal in-bounds behavior: reflect off edges.
+    if (gpsLat < mockCfg.minLat) gpsLat = mockCfg.minLat + (mockCfg.minLat - gpsLat);
+    if (gpsLat > mockCfg.maxLat) gpsLat = mockCfg.maxLat - (gpsLat - mockCfg.maxLat);
+    if (gpsLng < mockCfg.minLng) gpsLng = mockCfg.minLng + (mockCfg.minLng - gpsLng);
+    if (gpsLng > mockCfg.maxLng) gpsLng = mockCfg.maxLng - (gpsLng - mockCfg.maxLng);
+
+    // Final clamp (if reflection overshot).
+    if (gpsLat < mockCfg.minLat) gpsLat = mockCfg.minLat;
+    if (gpsLat > mockCfg.maxLat) gpsLat = mockCfg.maxLat;
+    if (gpsLng < mockCfg.minLng) gpsLng = mockCfg.minLng;
+    if (gpsLng > mockCfg.maxLng) gpsLng = mockCfg.maxLng;
+    return;
+  }
 
   float stepM = mockCfg.radiusM * 0.08f;
   if (stepM < 2.0f) stepM = 2.0f;
@@ -353,11 +425,42 @@ static void applyConfigFromServer(const String &responseBody) {
     JsonObject c = cfgObj["gps_center"].as<JsonObject>();
     if (!c["lat"].isNull()) mockCfg.centerLat = c["lat"].as<float>();
     if (!c["lng"].isNull()) mockCfg.centerLng = c["lng"].as<float>();
-    gpsInited = false; // re-seed around new center
   }
   if (cfgObj.containsKey("gps_radius_m")) {
     float r = cfgObj["gps_radius_m"].as<float>();
     if (r >= 1.0f) mockCfg.radiusM = r;
+  }
+  if (cfgObj.containsKey("gps_bbox") && cfgObj["gps_bbox"].is<JsonObject>()) {
+    JsonObject b = cfgObj["gps_bbox"].as<JsonObject>();
+    float minLat = b["min_lat"].as<float>();
+    float maxLat = b["max_lat"].as<float>();
+    float minLng = b["min_lng"].as<float>();
+    float maxLng = b["max_lng"].as<float>();
+    if (minLat > maxLat) {
+      float t = minLat;
+      minLat = maxLat;
+      maxLat = t;
+    }
+    if (minLng > maxLng) {
+      float t = minLng;
+      minLng = maxLng;
+      maxLng = t;
+    }
+    if ((maxLat - minLat) > 0.0f && (maxLng - minLng) > 0.0f) {
+      mockCfg.minLat = minLat;
+      mockCfg.maxLat = maxLat;
+      mockCfg.minLng = minLng;
+      mockCfg.maxLng = maxLng;
+    }
+  }
+  if (cfgObj.containsKey("gps_mode")) {
+    const char *mode = cfgObj["gps_mode"] | "";
+    String m = String(mode);
+    m.toLowerCase();
+    mockCfg.useBbox = (m == "bbox");
+  }
+  if (cfgObj.containsKey("force_oob")) {
+    mockCfg.forceOob = (bool)cfgObj["force_oob"];
   }
   if (cfgObj.containsKey("battery_drain")) {
     int d = cfgObj["battery_drain"].as<int>();
@@ -366,6 +469,8 @@ static void applyConfigFromServer(const String &responseBody) {
   if (cfgObj.containsKey("battery_loop")) {
     mockCfg.batteryLoop = (bool)cfgObj["battery_loop"];
   }
+
+  gpsInited = false; // re-seed after any GPS config change
 }
 
 static void maybePostData() {

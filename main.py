@@ -15,8 +15,16 @@ DB_PATH = Path(__file__).resolve().with_name("basestation.db")
 
 # Global mock config pushed down to devices (dog tracker demo).
 server_config: dict[str, Any] = {
-    "gps_center": {"lat": 14.5995, "lng": 120.9842},  # Manila default
+    "gps_center": {"lat": 14.5995, "lng": 120.9842},  # fallback/default
     "gps_radius_m": 150.0,
+    # Bounding box for the current demo area (test grid).
+    "gps_bbox": {
+        "min_lat": 10.657589126982737,
+        "max_lat": 10.65811214392038,
+        "min_lng": 122.95009491944131,
+        "max_lng": 122.95057763399497,
+    },
+    "gps_mode": "bbox",  # "radius" | "bbox"
     "battery_drain": 1,
     "battery_loop": True,
 }
@@ -57,7 +65,8 @@ def _init_db() -> None:
                 device_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 first_seen REAL NOT NULL,
-                last_seen REAL NOT NULL
+                last_seen REAL NOT NULL,
+                force_oob INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -91,6 +100,12 @@ def _init_db() -> None:
             """
         )
 
+        # Best-effort migrations for existing DBs.
+        try:
+            conn.execute("ALTER TABLE devices ADD COLUMN force_oob INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+
 
 def _load_server_config() -> None:
     global server_config
@@ -118,11 +133,71 @@ def _save_server_config() -> None:
 _init_db()
 _load_server_config()
 
+def _compute_geofence(data: dict[str, Any]) -> dict[str, Any]:
+    gps = data.get("gps") if isinstance(data.get("gps"), dict) else None
+    if not gps:
+        return {"out_of_bounds": None, "in_bounds": None, "reason": "no_gps"}
+
+    try:
+        lat = float(gps.get("lat"))
+        lng = float(gps.get("lng"))
+    except Exception:
+        return {"out_of_bounds": None, "in_bounds": None, "reason": "bad_gps"}
+
+    mode = str(server_config.get("gps_mode") or "radius").lower()
+    if mode == "bbox":
+        bbox = server_config.get("gps_bbox") if isinstance(server_config.get("gps_bbox"), dict) else None
+        if not bbox:
+            return {"out_of_bounds": None, "in_bounds": None, "reason": "no_bbox"}
+        try:
+            min_lat = float(bbox.get("min_lat"))
+            max_lat = float(bbox.get("max_lat"))
+            min_lng = float(bbox.get("min_lng"))
+            max_lng = float(bbox.get("max_lng"))
+        except Exception:
+            return {"out_of_bounds": None, "in_bounds": None, "reason": "bad_bbox"}
+        in_bounds = (min_lat <= lat <= max_lat) and (min_lng <= lng <= max_lng)
+        return {
+            "out_of_bounds": (not in_bounds),
+            "in_bounds": in_bounds,
+            "reason": "bbox",
+        }
+
+    # radius mode (approx)
+    center = server_config.get("gps_center") if isinstance(server_config.get("gps_center"), dict) else None
+    radius_m = server_config.get("gps_radius_m")
+    if not center:
+        return {"out_of_bounds": None, "in_bounds": None, "reason": "no_center"}
+    try:
+        clat = float(center.get("lat"))
+        clng = float(center.get("lng"))
+        r_m = float(radius_m)
+    except Exception:
+        return {"out_of_bounds": None, "in_bounds": None, "reason": "bad_center"}
+    if r_m <= 0:
+        return {"out_of_bounds": None, "in_bounds": None, "reason": "bad_radius"}
+
+    # Small-area approximation.
+    import math
+
+    meters_per_deg_lat = 111_320.0
+    meters_per_deg_lng = 111_320.0 * math.cos(math.radians(clat))
+    d_lat_m = (lat - clat) * meters_per_deg_lat
+    d_lng_m = (lng - clng) * (meters_per_deg_lng or 1.0)
+    dist_m = math.sqrt(d_lat_m * d_lat_m + d_lng_m * d_lng_m)
+    in_bounds = dist_m <= r_m
+    return {
+        "out_of_bounds": (not in_bounds),
+        "in_bounds": in_bounds,
+        "reason": "radius",
+    }
+
 
 def _device_view(device_id: str, entry: dict[str, Any]) -> dict[str, Any]:
     last_seen = float(entry.get("last_seen", 0.0))
     data = entry.get("data") or {}
     name = entry.get("name") or data.get("name") or _default_name(device_id)
+    force_oob = bool(entry.get("force_oob") or False)
     age_s = max(0.0, time.time() - last_seen) if last_seen else None
     status = "offline"
     if last_seen and age_s is not None and age_s <= HEARTBEAT_TIMEOUT_S:
@@ -134,6 +209,8 @@ def _device_view(device_id: str, entry: dict[str, Any]) -> dict[str, Any]:
         "age_s": age_s,
         "status": status,
         "data": data,
+        "geofence": _compute_geofence(data),
+        "force_oob": force_oob,
     }
 
 
@@ -149,7 +226,7 @@ def list_devices():
     with _db() as conn:
         rows = conn.execute(
             """
-            SELECT d.device_id, d.name, d.last_seen,
+            SELECT d.device_id, d.name, d.last_seen, d.force_oob,
                    r.raw_json AS raw_json
             FROM devices d
             LEFT JOIN readings r
@@ -176,7 +253,12 @@ def list_devices():
         devices_view.append(
             _device_view(
                 row["device_id"],
-                {"last_seen": float(row["last_seen"]), "data": payload, "name": row["name"]},
+                {
+                    "last_seen": float(row["last_seen"]),
+                    "data": payload,
+                    "name": row["name"],
+                    "force_oob": int(row["force_oob"] or 0),
+                },
             )
         )
 
@@ -202,6 +284,10 @@ def set_config():
     if not isinstance(gps_center, dict):
         gps_center = {}
 
+    gps_bbox = cfg.get("gps_bbox")
+    if gps_bbox is not None and not isinstance(gps_bbox, dict):
+        gps_bbox = None
+
     server_config["gps_center"] = {
         "lat": _coerce_float(gps_center.get("lat"), server_config["gps_center"]["lat"]),
         "lng": _coerce_float(gps_center.get("lng"), server_config["gps_center"]["lng"]),
@@ -209,6 +295,35 @@ def set_config():
     server_config["gps_radius_m"] = max(
         1.0, _coerce_float(cfg.get("gps_radius_m"), server_config["gps_radius_m"])
     )
+
+    # Optional bbox config.
+    if isinstance(gps_bbox, dict):
+        min_lat = _coerce_float(gps_bbox.get("min_lat"), 0.0)
+        max_lat = _coerce_float(gps_bbox.get("max_lat"), 0.0)
+        min_lng = _coerce_float(gps_bbox.get("min_lng"), 0.0)
+        max_lng = _coerce_float(gps_bbox.get("max_lng"), 0.0)
+        if min_lat > max_lat:
+            min_lat, max_lat = max_lat, min_lat
+        if min_lng > max_lng:
+            min_lng, max_lng = max_lng, min_lng
+        if (max_lat - min_lat) > 0 and (max_lng - min_lng) > 0:
+            server_config["gps_bbox"] = {
+                "min_lat": min_lat,
+                "max_lat": max_lat,
+                "min_lng": min_lng,
+                "max_lng": max_lng,
+            }
+        else:
+            server_config["gps_bbox"] = None
+    elif gps_bbox is None:
+        # Allow explicit clearing: gps_bbox=null
+        server_config["gps_bbox"] = None
+
+    gps_mode = str(cfg.get("gps_mode") or server_config.get("gps_mode") or "radius").lower()
+    if gps_mode not in ("radius", "bbox"):
+        gps_mode = "radius"
+    server_config["gps_mode"] = gps_mode
+
     server_config["battery_drain"] = max(
         0, _coerce_int(cfg.get("battery_drain"), server_config["battery_drain"])
     )
@@ -234,9 +349,10 @@ def receive_data():
     now = time.time()
     with _db() as conn:
         row = conn.execute(
-            "SELECT name FROM devices WHERE device_id = ?", (device_id,)
+            "SELECT name, force_oob FROM devices WHERE device_id = ?", (device_id,)
         ).fetchone()
         stored_name = str(row["name"]).strip() if row else ""
+        force_oob = int(row["force_oob"] or 0) if row else 0
         name = incoming_name or stored_name or _default_name(device_id)
 
         # Upsert device.
@@ -247,8 +363,8 @@ def receive_data():
             )
         else:
             conn.execute(
-                "INSERT INTO devices(device_id, name, first_seen, last_seen) VALUES(?, ?, ?, ?)",
-                (device_id, name, now, now),
+                "INSERT INTO devices(device_id, name, first_seen, last_seen, force_oob) VALUES(?, ?, ?, ?, ?)",
+                (device_id, name, now, now, force_oob),
             )
 
         gps = data.get("gps") if isinstance(data.get("gps"), dict) else {}
@@ -280,7 +396,31 @@ def receive_data():
             (device_id, now, status_s, battery_i, lat_f, lng_f, json.dumps(data)),
         )
 
-    return jsonify({"status": "ok", "config": server_config})
+    response_config = dict(server_config)
+    response_config["force_oob"] = bool(force_oob)
+    return jsonify({"status": "ok", "config": response_config})
+
+
+@app.post("/device/<device_id>/oob")
+def set_device_oob(device_id: str):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"status": "error", "error": "invalid_json"}), 400
+    force = payload.get("force")
+    force_oob = 1 if bool(force) else 0
+
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT device_id FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if not row:
+            return jsonify({"status": "error", "error": "not_found"}), 404
+        conn.execute(
+            "UPDATE devices SET force_oob = ? WHERE device_id = ?",
+            (force_oob, device_id),
+        )
+
+    return jsonify({"status": "ok", "device_id": device_id, "force_oob": bool(force_oob)})
 
 
 @app.get("/history/<device_id>")

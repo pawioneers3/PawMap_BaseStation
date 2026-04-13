@@ -125,6 +125,16 @@
             border-color: rgba(220, 38, 38, 0.25);
         }
 
+        .pill.warn {
+            background: rgba(245, 158, 11, 0.14);
+            border-color: rgba(245, 158, 11, 0.28);
+        }
+
+        .pill.info {
+            background: rgba(37, 99, 235, 0.10);
+            border-color: rgba(37, 99, 235, 0.20);
+        }
+
         .panel {
             background: var(--panel);
             border: 1px solid var(--border);
@@ -229,6 +239,12 @@
             border-radius: 12px;
             border: 1px solid var(--border);
             background: #fff;
+        }
+
+        button.small {
+            padding: 7px 10px;
+            border-radius: 9px;
+            font-size: 13px;
         }
 
         /* Modal */
@@ -348,6 +364,14 @@
             <div class="panel-body">
                 <div class="row" style="gap:12px;">
                     <div>
+                        <div style="font-size:12px;color:var(--muted);">GPS Mode</div>
+                        <select id="cfgGpsMode"
+                            style="height:42px;border-radius:10px;border:1px solid var(--border);padding:0 10px;background:#fff;color:var(--text);">
+                            <option value="radius">Center + Radius</option>
+                            <option value="bbox">Bounding Box</option>
+                        </select>
+                    </div>
+                    <div>
                         <div style="font-size:12px;color:var(--muted);">Center Lat</div>
                         <input id="cfgCenterLat" style="width:160px;" />
                     </div>
@@ -358,6 +382,22 @@
                     <div>
                         <div style="font-size:12px;color:var(--muted);">Radius (m)</div>
                         <input id="cfgRadiusM" style="width:140px;" />
+                    </div>
+                    <div>
+                        <div style="font-size:12px;color:var(--muted);">Min Lat</div>
+                        <input id="cfgMinLat" style="width:160px;" />
+                    </div>
+                    <div>
+                        <div style="font-size:12px;color:var(--muted);">Max Lat</div>
+                        <input id="cfgMaxLat" style="width:160px;" />
+                    </div>
+                    <div>
+                        <div style="font-size:12px;color:var(--muted);">Min Lng</div>
+                        <input id="cfgMinLng" style="width:160px;" />
+                    </div>
+                    <div>
+                        <div style="font-size:12px;color:var(--muted);">Max Lng</div>
+                        <input id="cfgMaxLng" style="width:160px;" />
                     </div>
                     <div>
                         <div style="font-size:12px;color:var(--muted);">Battery Drain / Update</div>
@@ -530,6 +570,23 @@
             const lng = Number(gps.lng);
             if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
 
+            const mode = (cfg.gps_mode || "radius").toString().toLowerCase();
+            const bbox = cfg.gps_bbox;
+            if (mode === "bbox" && bbox && typeof bbox === "object") {
+                const minLat = Number(bbox.min_lat);
+                const maxLat = Number(bbox.max_lat);
+                const minLng = Number(bbox.min_lng);
+                const maxLng = Number(bbox.max_lng);
+                if (!Number.isFinite(minLat) || !Number.isFinite(maxLat) || !Number.isFinite(minLng) || !Number.isFinite(maxLng)) {
+                    return null;
+                }
+                if (maxLat <= minLat || maxLng <= minLng) return null;
+                // Normalize into [-1, 1] range for the mini-map.
+                const nx = ((lng - minLng) / (maxLng - minLng)) * 2 - 1;
+                const ny = ((lat - minLat) / (maxLat - minLat)) * 2 - 1;
+                return { nx, ny };
+            }
+
             const center = cfg.gps_center || {};
             const clat = Number(center.lat);
             const clng = Number(center.lng);
@@ -553,8 +610,8 @@
             let y = size / 2;
             let ok = false;
             if (p) {
-                const nx = clamp(p.dLngM / p.radiusM, -1, 1);
-                const ny = clamp(p.dLatM / p.radiusM, -1, 1);
+                const nx = ("nx" in p) ? clamp(p.nx, -1, 1) : clamp(p.dLngM / p.radiusM, -1, 1);
+                const ny = ("ny" in p) ? clamp(p.ny, -1, 1) : clamp(p.dLatM / p.radiusM, -1, 1);
                 x = size / 2 + nx * r;
                 y = size / 2 - ny * r;
                 ok = true;
@@ -607,13 +664,26 @@
                 const statusLabel = d.status === "online" ? "online" : "offline";
                 const battery = d.data ? d.data.battery : undefined;
                 const gps = d.data ? d.data.gps : undefined;
+                const gf = d.geofence || {};
+                const out = gf.out_of_bounds === true;
+                const forced = d.force_oob === true;
+                const fencePill = (gf.out_of_bounds === null || gf.out_of_bounds === undefined)
+                    ? `<span class="pill info">fence: n/a</span>`
+                    : out
+                        ? `<span class="pill warn">out of bounds</span>`
+                        : `<span class="pill online">in bounds</span>`;
+                const demoPill = forced ? `<span class="pill info">demo: force OOB</span>` : ``;
                 return `
                     <tr>
                         <td>
                             <div style="font-weight:bold;">${(d.name || "").toString()}</div>
                             <div class="muted" style="font-size:12px;"><code>${d.device_id}</code></div>
                         </td>
-                        <td><span class="pill ${statusClass}">${statusLabel}</span></td>
+                        <td>
+                            <div><span class="pill ${statusClass}">${statusLabel}</span></div>
+                            <div style="margin-top:6px;">${fencePill}</div>
+                            ${demoPill ? `<div style="margin-top:6px;">${demoPill}</div>` : ``}
+                        </td>
                         <td>
                             <div>${fmtAge(d.age_s)}</div>
                             <div class="muted" style="font-size:12px;" title="${fmtLastSeen(d.last_seen)}">${fmtLastSeen(d.last_seen)}</div>
@@ -623,7 +693,12 @@
                             <div class="muted" style="font-size:12px;margin-bottom:6px;">${fmtGps(gps)}</div>
                             ${renderMiniMap(gps)}
                         </td>
-                        <td><button class="histBtn" data-id="${d.device_id}" data-name="${(d.name || "").toString().replace(/\"/g, '&quot;')}">History</button></td>
+                        <td>
+                            <div class="row" style="gap:8px;">
+                                <button class="histBtn small" data-id="${d.device_id}" data-name="${(d.name || "").toString().replace(/\"/g, '&quot;')}">History</button>
+                                <button class="oobBtn small" data-id="${d.device_id}" data-force="${forced ? "1" : "0"}">${forced ? "Stop Forcing" : "Force OOB"}</button>
+                            </div>
+                        </td>
                         <td><pre>${prettyJson(d.data)}</pre></td>
                     </tr>
                 `;
@@ -753,10 +828,16 @@
             try {
                 const cfg = await fetchConfig();
                 currentConfig = cfg;
+                document.getElementById("cfgGpsMode").value = (cfg.gps_mode || "radius").toString();
                 const center = cfg.gps_center || {};
                 document.getElementById("cfgCenterLat").value = (center.lat ?? "").toString();
                 document.getElementById("cfgCenterLng").value = (center.lng ?? "").toString();
                 document.getElementById("cfgRadiusM").value = (cfg.gps_radius_m ?? "").toString();
+                const bbox = cfg.gps_bbox || {};
+                document.getElementById("cfgMinLat").value = (bbox.min_lat ?? "").toString();
+                document.getElementById("cfgMaxLat").value = (bbox.max_lat ?? "").toString();
+                document.getElementById("cfgMinLng").value = (bbox.min_lng ?? "").toString();
+                document.getElementById("cfgMaxLng").value = (bbox.max_lng ?? "").toString();
                 document.getElementById("cfgBatteryDrain").value = (cfg.battery_drain ?? "").toString();
                 document.getElementById("cfgBatteryLoop").checked = !!cfg.battery_loop;
                 document.getElementById("cfgStatus").textContent = "";
@@ -770,14 +851,29 @@
             const status = document.getElementById("cfgStatus");
             status.textContent = "Saving…";
 
+            const gpsMode = document.getElementById("cfgGpsMode").value;
             const lat = Number(document.getElementById("cfgCenterLat").value);
             const lng = Number(document.getElementById("cfgCenterLng").value);
             const radiusM = Number(document.getElementById("cfgRadiusM").value);
+            const minLat = Number(document.getElementById("cfgMinLat").value);
+            const maxLat = Number(document.getElementById("cfgMaxLat").value);
+            const minLng = Number(document.getElementById("cfgMinLng").value);
+            const maxLng = Number(document.getElementById("cfgMaxLng").value);
             const drain = Number(document.getElementById("cfgBatteryDrain").value);
             const loop = document.getElementById("cfgBatteryLoop").checked;
 
-            if (!Number.isFinite(lat) || !Number.isFinite(lng) || !Number.isFinite(radiusM) || !Number.isFinite(drain)) {
-                status.textContent = "Please enter valid numbers.";
+            const needsCenter = gpsMode === "radius";
+            const needsBbox = gpsMode === "bbox";
+            if (needsCenter && (!Number.isFinite(lat) || !Number.isFinite(lng) || !Number.isFinite(radiusM))) {
+                status.textContent = "Please enter valid center + radius numbers.";
+                return;
+            }
+            if (needsBbox && (!Number.isFinite(minLat) || !Number.isFinite(maxLat) || !Number.isFinite(minLng) || !Number.isFinite(maxLng))) {
+                status.textContent = "Please enter valid bbox numbers.";
+                return;
+            }
+            if (!Number.isFinite(drain)) {
+                status.textContent = "Please enter valid battery drain.";
                 return;
             }
 
@@ -787,8 +883,10 @@
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
                         config: {
+                            gps_mode: gpsMode,
                             gps_center: { lat, lng },
                             gps_radius_m: radiusM,
+                            gps_bbox: needsBbox ? { min_lat: minLat, max_lat: maxLat, min_lng: minLng, max_lng: maxLng } : null,
                             battery_drain: Math.max(0, Math.round(drain)),
                             battery_loop: loop,
                         }
@@ -872,6 +970,29 @@
             const btn = e.target.closest(".histBtn");
             if (!btn) return;
             openHistory(btn.dataset.id, btn.dataset.name);
+        });
+
+        // event delegation for force OOB
+        document.getElementById("deviceTbody").addEventListener("click", async (e) => {
+            const btn = e.target.closest(".oobBtn");
+            if (!btn) return;
+            const deviceId = btn.dataset.id;
+            const forced = btn.dataset.force === "1";
+            btn.disabled = true;
+            btn.textContent = forced ? "Stopping…" : "Forcing…";
+            try {
+                const resp = await fetch(`/device/${encodeURIComponent(deviceId)}/oob`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ force: !forced }),
+                });
+                if (!resp.ok) throw new Error("oob_failed");
+            } catch (_) {
+                // no-op; next poll will refresh anyway
+            } finally {
+                btn.disabled = false;
+            }
+            pollLoop();
         });
 
         // search filter
