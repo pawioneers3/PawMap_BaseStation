@@ -12,6 +12,8 @@ app = Flask(__name__)
 
 HEARTBEAT_TIMEOUT_S = 10
 DB_PATH = Path(__file__).resolve().with_name("basestation.db")
+NOTIFY_COOLDOWN_S = 60
+BATTERY_LOW_THRESHOLD = 10
 
 # Global mock config pushed down to devices (dog tracker demo).
 server_config: dict[str, Any] = {
@@ -54,6 +56,7 @@ def _db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
+    conn.execute("PRAGMA busy_timeout=3000;")
     return conn
 
 
@@ -66,7 +69,11 @@ def _init_db() -> None:
                 name TEXT NOT NULL,
                 first_seen REAL NOT NULL,
                 last_seen REAL NOT NULL,
-                force_oob INTEGER NOT NULL DEFAULT 0
+                force_oob INTEGER NOT NULL DEFAULT 0,
+                last_oob INTEGER,
+                last_notify_ts REAL NOT NULL DEFAULT 0,
+                last_batt_low INTEGER,
+                last_batt_notify_ts REAL NOT NULL DEFAULT 0
             )
             """
         )
@@ -100,9 +107,54 @@ def _init_db() -> None:
             """
         )
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fcm_tokens (
+                token TEXT PRIMARY KEY,
+                device_id TEXT,
+                platform TEXT,
+                created_at REAL NOT NULL,
+                last_used_at REAL,
+                FOREIGN KEY(device_id) REFERENCES devices(device_id) ON DELETE SET NULL
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                ts REAL NOT NULL,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                ok INTEGER NOT NULL,
+                response TEXT,
+                FOREIGN KEY(device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+            )
+            """
+        )
+
         # Best-effort migrations for existing DBs.
         try:
             conn.execute("ALTER TABLE devices ADD COLUMN force_oob INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE devices ADD COLUMN last_oob INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE devices ADD COLUMN last_notify_ts REAL NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE devices ADD COLUMN last_batt_low INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE devices ADD COLUMN last_batt_notify_ts REAL NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
 
@@ -191,6 +243,142 @@ def _compute_geofence(data: dict[str, Any]) -> dict[str, Any]:
         "in_bounds": in_bounds,
         "reason": "radius",
     }
+
+
+def _fcm_is_configured() -> bool:
+    # Either provide a service account file path, or disable (then we just log).
+    import os
+
+    return bool(os.environ.get("FCM_SERVICE_ACCOUNT_FILE"))
+
+
+_fcm_token_cache: dict[str, Any] = {"token": None, "exp": 0.0}
+
+
+def _fcm_access_token() -> str | None:
+    import os
+
+    if not _fcm_is_configured():
+        return None
+
+    now = time.time()
+    if _fcm_token_cache["token"] and now < float(_fcm_token_cache["exp"] or 0) - 60:
+        return str(_fcm_token_cache["token"])
+
+    try:
+        from google.auth.transport.requests import Request as GoogleAuthRequest
+        from google.oauth2 import service_account
+    except Exception:
+        return None
+
+    sa_file = os.environ.get("FCM_SERVICE_ACCOUNT_FILE")
+    if not sa_file:
+        return None
+
+    scopes = ["https://www.googleapis.com/auth/firebase.messaging"]
+    creds = service_account.Credentials.from_service_account_file(sa_file, scopes=scopes)
+    creds.refresh(GoogleAuthRequest())
+    _fcm_token_cache["token"] = creds.token
+    # creds.expiry is a datetime
+    try:
+        _fcm_token_cache["exp"] = float(creds.expiry.timestamp())  # type: ignore[union-attr]
+    except Exception:
+        _fcm_token_cache["exp"] = now + 3000
+    return str(creds.token)
+
+
+def _fcm_project_id() -> str | None:
+    import os
+
+    pid = os.environ.get("FCM_PROJECT_ID")
+    if pid:
+        return pid
+
+    sa_file = os.environ.get("FCM_SERVICE_ACCOUNT_FILE")
+    if not sa_file:
+        return None
+    try:
+        with open(sa_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        pid = data.get("project_id")
+        return str(pid) if pid else None
+    except Exception:
+        return None
+
+
+def _send_fcm(token: str, title: str, body: str, data: dict[str, Any]) -> tuple[bool, str]:
+    access = _fcm_access_token()
+    project_id = _fcm_project_id()
+    if not access or not project_id:
+        return False, "fcm_not_configured"
+
+    try:
+        import requests  # type: ignore
+    except Exception:
+        return False, "missing_requests"
+
+    url = f"https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"
+    payload = {
+        "message": {
+            "token": token,
+            "notification": {"title": title, "body": body},
+            "data": {k: str(v) for k, v in (data or {}).items()},
+        }
+    }
+    try:
+        resp = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=6,
+        )
+        ok = 200 <= resp.status_code < 300
+        return ok, resp.text[:2000]
+    except Exception as e:
+        return False, f"exception:{e!r}"
+
+
+def _record_and_send_notification(
+    *,
+    device_id: str,
+    kind: str,
+    title: str,
+    body: str,
+    now: float,
+    tokens: list[str],
+    data: dict[str, Any],
+) -> None:
+    if not tokens:
+        with _db() as conn:
+            conn.execute(
+                """
+                INSERT INTO notifications(device_id, ts, kind, title, body, ok, response)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (device_id, now, kind, title, body, 0, "no_tokens"),
+            )
+        return
+
+    any_ok = False
+    responses: list[str] = []
+    for tok in tokens:
+        ok, resp = _send_fcm(tok, title, body, data)
+        any_ok = any_ok or ok
+        responses.append(resp)
+
+    with _db() as conn:
+        for tok in tokens:
+            conn.execute(
+                "UPDATE fcm_tokens SET last_used_at = ? WHERE token = ?",
+                (now, tok),
+            )
+        conn.execute(
+            """
+            INSERT INTO notifications(device_id, ts, kind, title, body, ok, response)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            (device_id, now, kind, title, body, 1 if any_ok else 0, "\n---\n".join(responses)[:2000]),
+        )
 
 
 def _device_view(device_id: str, entry: dict[str, Any]) -> dict[str, Any]:
@@ -347,13 +535,27 @@ def receive_data():
     incoming_name = str(data.get("name") or "").strip()
 
     now = time.time()
+    notify_tokens: list[str] = []
+    notify_kind = ""
+    notify_title = ""
+    notify_body = ""
+    notify_data: dict[str, Any] = {}
+    should_notify = False
+    force_oob_bool = False
+    name = ""
     with _db() as conn:
         row = conn.execute(
-            "SELECT name, force_oob FROM devices WHERE device_id = ?", (device_id,)
+            "SELECT name, force_oob, last_oob, last_notify_ts, last_batt_low, last_batt_notify_ts FROM devices WHERE device_id = ?",
+            (device_id,),
         ).fetchone()
         stored_name = str(row["name"]).strip() if row else ""
         force_oob = int(row["force_oob"] or 0) if row else 0
+        prev_oob = int(row["last_oob"]) if (row and row["last_oob"] is not None) else None
+        last_notify_ts = float(row["last_notify_ts"] or 0.0) if row else 0.0
+        prev_batt_low = int(row["last_batt_low"]) if (row and row["last_batt_low"] is not None) else None
+        last_batt_notify_ts = float(row["last_batt_notify_ts"] or 0.0) if row else 0.0
         name = incoming_name or stored_name or _default_name(device_id)
+        force_oob_bool = bool(force_oob)
 
         # Upsert device.
         if row:
@@ -396,8 +598,87 @@ def receive_data():
             (device_id, now, status_s, battery_i, lat_f, lng_f, json.dumps(data)),
         )
 
+        # Update last_oob + possibly trigger notification.
+        geofence = _compute_geofence(data)
+        out = geofence.get("out_of_bounds")
+        out_i = 1 if out is True else 0 if out is False else None
+        conn.execute(
+            "UPDATE devices SET last_oob = ? WHERE device_id = ?",
+            (out_i, device_id),
+        )
+
+        # Battery low tracking + notify (transition -> low, cooldown).
+        if battery_i is not None:
+            batt_low = 1 if battery_i < BATTERY_LOW_THRESHOLD else 0
+        else:
+            batt_low = None
+        conn.execute(
+            "UPDATE devices SET last_batt_low = ? WHERE device_id = ?",
+            (batt_low, device_id),
+        )
+
+        # Decide whether to notify (priority: OOB, else low battery).
+        if out is True and prev_oob != 1 and (now - (last_notify_ts or 0.0) >= NOTIFY_COOLDOWN_S):
+            should_notify = True
+            reason = "forced" if force_oob_bool else str(geofence.get("reason") or "geofence")
+            notify_kind = "oob"
+            notify_title = "Dog out of bounds"
+            notify_body = f"{name} left the safe area ({reason})."
+            notify_data = {"device_id": device_id, "name": name, "event": "oob", "reason": reason}
+            rows = conn.execute(
+                """
+                SELECT token FROM fcm_tokens
+                WHERE device_id = ? OR device_id IS NULL
+                """,
+                (device_id,),
+            ).fetchall()
+            notify_tokens = [str(r["token"]) for r in rows]
+            # Reserve the cooldown immediately to avoid duplicates.
+            conn.execute(
+                "UPDATE devices SET last_notify_ts = ? WHERE device_id = ?",
+                (now, device_id),
+            )
+        elif (
+            batt_low == 1
+            and prev_batt_low != 1
+            and (now - (last_batt_notify_ts or 0.0) >= NOTIFY_COOLDOWN_S)
+        ):
+            should_notify = True
+            notify_kind = "low_battery"
+            notify_title = "Low battery"
+            notify_body = f"{name} battery is low ({battery_i}%)."
+            notify_data = {
+                "device_id": device_id,
+                "name": name,
+                "event": "low_battery",
+                "battery": battery_i,
+            }
+            rows = conn.execute(
+                """
+                SELECT token FROM fcm_tokens
+                WHERE device_id = ? OR device_id IS NULL
+                """,
+                (device_id,),
+            ).fetchall()
+            notify_tokens = [str(r["token"]) for r in rows]
+            conn.execute(
+                "UPDATE devices SET last_batt_notify_ts = ? WHERE device_id = ?",
+                (now, device_id),
+            )
+
     response_config = dict(server_config)
     response_config["force_oob"] = bool(force_oob)
+
+    if should_notify:
+        _record_and_send_notification(
+            device_id=device_id,
+            kind=notify_kind,
+            title=notify_title,
+            body=notify_body,
+            now=now,
+            tokens=notify_tokens,
+            data=notify_data,
+        )
     return jsonify({"status": "ok", "config": response_config})
 
 
@@ -421,6 +702,61 @@ def set_device_oob(device_id: str):
         )
 
     return jsonify({"status": "ok", "device_id": device_id, "force_oob": bool(force_oob)})
+
+
+@app.delete("/device/<device_id>")
+def delete_device(device_id: str):
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT device_id FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if not row:
+            return jsonify({"status": "error", "error": "not_found"}), 404
+        conn.execute("DELETE FROM devices WHERE device_id = ?", (device_id,))
+
+    return jsonify({"status": "ok", "device_id": device_id})
+
+
+@app.post("/fcm/register")
+def register_fcm_token():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"status": "error", "error": "invalid_json"}), 400
+
+    token = str(payload.get("token") or "").strip()
+    device_id = str(payload.get("device_id") or "").strip() or None
+    platform = str(payload.get("platform") or "").strip() or None
+
+    if not token:
+        return jsonify({"status": "error", "error": "missing_token"}), 400
+
+    now = time.time()
+    with _db() as conn:
+        try:
+            conn.execute(
+                """
+                INSERT INTO fcm_tokens(token, device_id, platform, created_at, last_used_at)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(token) DO UPDATE SET
+                  device_id=excluded.device_id,
+                  platform=excluded.platform
+                """,
+                (token, device_id, platform, now, None),
+            )
+        except sqlite3.IntegrityError:
+            # If a device_id was provided but doesn't exist yet, accept the token as global.
+            conn.execute(
+                """
+                INSERT INTO fcm_tokens(token, device_id, platform, created_at, last_used_at)
+                VALUES(?, NULL, ?, ?, ?)
+                ON CONFLICT(token) DO UPDATE SET
+                  device_id=NULL,
+                  platform=excluded.platform
+                """,
+                (token, platform, now, None),
+            )
+
+    return jsonify({"status": "ok"})
 
 
 @app.get("/history/<device_id>")
