@@ -1,0 +1,12 @@
+.env
+secrets/
+app.py
+
+# Local runtime DB files
+basestation.db
+basestation.db-shm
+basestation.db-wal
+
+# Python cache
+__pycache__/
+*.pyc
