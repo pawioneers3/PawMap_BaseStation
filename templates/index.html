@@ -3,6 +3,8 @@
 
 <head>
     <title>Base Station</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
     <style>
         :root {
             --bg: #f6f7fb;
@@ -29,6 +31,37 @@
             max-width: 1180px;
             margin: 0 auto;
             padding: 22px 18px 32px 18px;
+        }
+
+        .navbar {
+            background: #fff;
+            border-bottom: 1px solid var(--border);
+            padding: 10px 18px;
+        }
+
+        .nav-inner {
+            max-width: 1180px;
+            margin: 0 auto;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .nav-links a {
+            text-decoration: none;
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 6px 10px;
+            font-size: 13px;
+            background: #fff;
         }
 
         .row {
@@ -128,6 +161,11 @@
         .pill.warn {
             background: rgba(245, 158, 11, 0.14);
             border-color: rgba(245, 158, 11, 0.28);
+        }
+
+        .pill.critical {
+            background: rgba(245, 158, 11, 0.20);
+            border-color: rgba(245, 158, 11, 0.40);
         }
 
         .pill.info {
@@ -233,18 +271,19 @@
             color: rgba(17, 24, 39, 0.6);
         }
 
-        .mini-map {
-            width: 64px;
-            height: 64px;
-            border-radius: 12px;
-            border: 1px solid var(--border);
-            background: #fff;
-        }
-
         button.small {
             padding: 7px 10px;
             border-radius: 9px;
             font-size: 13px;
+        }
+
+        button.subtle {
+            background: #f8fafc;
+        }
+
+        button.alert {
+            border-color: rgba(220, 38, 38, 0.35);
+            background: rgba(220, 38, 38, 0.08);
         }
 
         /* Modal */
@@ -265,6 +304,10 @@
             border: 1px solid var(--border);
             padding: 16px;
             box-shadow: var(--shadow);
+        }
+
+        .map-modal {
+            width: min(920px, 100%);
         }
 
         .modal h2 {
@@ -331,10 +374,35 @@
             border-radius: 10px;
             background: #fff;
         }
+
+        #leafletMap {
+            width: 100%;
+            height: 380px;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            background: #f8fafc;
+        }
     </style>
 </head>
 
 <body>
+    <div class="navbar">
+        <div class="nav-inner">
+            <div class="nav-links">
+                <a href="/dashboard">Tracker Dashboard</a>
+                <a href="/shelter">Shelter</a>
+            </div>
+            <div class="row">
+                <span class="pill info">Authenticated: {{ "yes" if user and user.id else "no" }}</span>
+                {% if user and user.email %}
+                <span class="subtitle">{{ user.email }}</span>
+                {% endif %}
+                <a href="/shelter/logout" style="text-decoration:none;">
+                    <button>Logout</button>
+                </a>
+            </div>
+        </div>
+    </div>
     <div class="container">
         <div class="topbar">
             <div class="title">
@@ -343,6 +411,7 @@
             </div>
             <div class="row">
                 <input id="searchBox" placeholder="Search name or device_id…" style="width:260px;margin-top:0;" />
+                <button onclick="openTestPush()">Test Push</button>
                 <button class="primary" onclick="startPairing()">Add Device</button>
                 <span class="pill" id="pollPill">Polling…</span>
             </div>
@@ -367,6 +436,7 @@
                     <div style="min-width:260px;">
                         <div style="font-size:12px;color:var(--muted);">GPS Area (Bounding Box)</div>
                         <div class="subtitle">Devices are in-bounds if GPS is inside min/max lat/lng.</div>
+                        <div class="subtitle" id="bboxSourceHint" style="margin-top:4px;"></div>
                     </div>
                     <div>
                         <div style="font-size:12px;color:var(--muted);">Min Lat</div>
@@ -424,6 +494,22 @@
             </div>
         </div>
 
+    </div>
+
+    <div class="modal-backdrop" id="mapBackdrop" role="dialog" aria-modal="true">
+        <div class="modal map-modal">
+            <div class="row" style="justify-content:space-between;">
+                <h2 style="margin:0;">Last Known Location</h2>
+                <button class="primary" onclick="closeMapModal()">Close</button>
+            </div>
+            <div class="hint" id="mapTitle"></div>
+            <div id="leafletMap" style="margin-top:12px;"></div>
+            <div class="row" style="gap:10px; margin-top:10px;">
+                <span class="pill" id="mapStatusPill">status: —</span>
+                <span class="pill" id="mapLastSeenPill">last seen: —</span>
+                <span class="pill" id="mapBatteryPill">battery: —</span>
+            </div>
+        </div>
     </div>
 
     <div class="modal-backdrop" id="historyBackdrop" role="dialog" aria-modal="true">
@@ -484,10 +570,44 @@
         </div>
     </div>
 
+    <div class="modal-backdrop" id="testPushBackdrop" role="dialog" aria-modal="true">
+        <div class="modal">
+            <h2>Send Test Push</h2>
+            <div class="hint">Use this to quickly validate Firebase push delivery.</div>
+
+            <label>Target Device ID (optional)</label>
+            <input id="testPushDeviceId" placeholder="blank = send to all registered tokens" />
+
+            <label>Title</label>
+            <input id="testPushTitle" value="Test alert" />
+
+            <label>Body</label>
+            <input id="testPushBody" value="This is a test push notification from Base Station." />
+
+            <label style="display:flex;align-items:center;gap:8px;margin-top:10px;">
+                <input type="checkbox" id="testPushIncludeGlobal" checked />
+                Include global tokens
+            </label>
+
+            <div class="status-line" id="testPushStatus"></div>
+            <div class="actions">
+                <button onclick="closeTestPush()">Cancel</button>
+                <button class="primary" onclick="sendTestPush()">Send Test Push</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
     <script>
         const HEARTBEAT_TIMEOUT_S = 10;
         let currentConfig = null;
         let lastDevices = [];
+        let mapInstance = null;
+        let mapLayerGroup = null;
+        let activeMapDeviceId = null;
+        let mapRefreshInFlight = false;
+        let mapRefreshQueued = false;
 
         function fmtLastSeen(tsSeconds) {
             if (!tsSeconds) return "—";
@@ -516,8 +636,9 @@
             pill.className = "pill " + (ok ? "online" : "offline");
         }
 
-        async function fetchDevices() {
-            const resp = await fetch("/devices", { cache: "no-store" });
+        async function fetchDevices(includeUnowned = false) {
+            const url = includeUnowned ? "/devices?include_unowned=1" : "/devices";
+            const resp = await fetch(url, { cache: "no-store" });
             if (!resp.ok) throw new Error("devices_fetch_failed");
             const payload = await resp.json();
             return payload.devices || [];
@@ -549,67 +670,40 @@
             return Math.max(lo, Math.min(hi, v));
         }
 
-        function gpsToXYm(gps, cfg) {
-            if (!gps || typeof gps !== "object" || !cfg) return null;
-            const lat = Number(gps.lat);
-            const lng = Number(gps.lng);
+        function gpsPointFromPayload(p) {
+            const lat = Number(p?.lat);
+            const lng = Number(p?.lng);
             if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
-
-            const bbox = cfg.gps_bbox;
-            if (bbox && typeof bbox === "object") {
-                const minLat = Number(bbox.min_lat);
-                const maxLat = Number(bbox.max_lat);
-                const minLng = Number(bbox.min_lng);
-                const maxLng = Number(bbox.max_lng);
-                if (!Number.isFinite(minLat) || !Number.isFinite(maxLat) || !Number.isFinite(minLng) || !Number.isFinite(maxLng)) {
-                    return null;
-                }
-                if (maxLat <= minLat || maxLng <= minLng) return null;
-                // Normalize into [-1, 1] range for the mini-map.
-                const nx = ((lng - minLng) / (maxLng - minLng)) * 2 - 1;
-                const ny = ((lat - minLat) / (maxLat - minLat)) * 2 - 1;
-                return { nx, ny };
-            }
-            return null;
+            return { lat, lng };
         }
 
-        function renderMiniMap(gps) {
-            const cfg = currentConfig;
-            const p = gpsToXYm(gps, cfg);
-            const size = 64;
-            const r = 28;
-            let x = size / 2;
-            let y = size / 2;
-            let ok = false;
-            if (p) {
-                const nx = clamp(p.nx, -1, 1);
-                const ny = clamp(p.ny, -1, 1);
-                x = size / 2 + nx * r;
-                y = size / 2 - ny * r;
-                ok = true;
-            }
-            const dot = ok ? `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3.5" fill="rgba(37,99,235,0.95)"/>` :
-                `<text x="32" y="36" font-size="10" text-anchor="middle" fill="rgba(17,24,39,0.45)">no gps</text>`;
-            return `
-                <svg class="mini-map" viewBox="0 0 64 64" aria-label="gps map">
-                    <circle cx="32" cy="32" r="28" fill="rgba(37,99,235,0.04)" stroke="rgba(17,24,39,0.12)" />
-                    <line x1="32" y1="6" x2="32" y2="58" stroke="rgba(17,24,39,0.10)" />
-                    <line x1="6" y1="32" x2="58" y2="32" stroke="rgba(17,24,39,0.10)" />
-                    ${dot}
-                </svg>
-            `;
+        function isLikelyLostPower(device) {
+            const battery = Number(device?.data?.battery);
+            const lowBattery = Number.isFinite(battery) && battery <= 10;
+            const forcedLow = device?.force_low_battery === true;
+            return forcedLow || (device?.status === "offline" && lowBattery);
         }
 
-        function renderBatteryCell(v) {
+        function renderBatteryCell(v, forcedLow = false) {
             if (v === null || v === undefined) {
+                if (forcedLow) {
+                    const n = 9;
+                    return `
+                        <div class="battery">
+                            <div class="battery-bar"><div class="battery-fill low" style="width:${n}%"></div></div>
+                            <div class="battery-label">${n}% (forced)</div>
+                        </div>
+                    `;
+                }
                 return `<div class="battery"><div class="battery-label">—</div></div>`;
             }
-            const n = clamp(Math.round(Number(v)), 0, 100);
+            let n = clamp(Math.round(Number(v)), 0, 100);
+            if (forcedLow) n = Math.min(n, 9);
             const low = n <= 20 ? "low" : "";
             return `
                 <div class="battery">
                     <div class="battery-bar"><div class="battery-fill ${low}" style="width:${n}%"></div></div>
-                    <div class="battery-label">${n}%</div>
+                    <div class="battery-label">${n}%${forcedLow ? " (forced)" : ""}</div>
                 </div>
             `;
         }
@@ -632,8 +726,14 @@
                 return;
             }
             tbody.innerHTML = filtered.map(d => {
-                const statusClass = d.status === "online" ? "online" : "offline";
-                const statusLabel = d.status === "online" ? "online" : "offline";
+                const forcedLow = d.force_low_battery === true;
+                const displayStatus = forcedLow ? "critical" : d.status;
+                const statusClass = displayStatus === "online"
+                    ? "online"
+                    : displayStatus === "critical"
+                        ? "critical"
+                        : "offline";
+                const statusLabel = displayStatus === "critical" ? "critical" : (d.status === "online" ? "online" : "offline");
                 const battery = d.data ? d.data.battery : undefined;
                 const gps = d.data ? d.data.gps : undefined;
                 const gf = d.geofence || {};
@@ -645,6 +745,7 @@
                         ? `<span class="pill warn">out of bounds</span>`
                         : `<span class="pill online">in bounds</span>`;
                 const demoPill = forced ? `<span class="pill info">demo: force OOB</span>` : ``;
+                const demoBattPill = forcedLow ? `<span class="pill info">demo: force low battery</span>` : ``;
                 return `
                     <tr>
                         <td>
@@ -655,20 +756,32 @@
                             <div><span class="pill ${statusClass}">${statusLabel}</span></div>
                             <div style="margin-top:6px;">${fencePill}</div>
                             ${demoPill ? `<div style="margin-top:6px;">${demoPill}</div>` : ``}
+                            ${demoBattPill ? `<div style="margin-top:6px;">${demoBattPill}</div>` : ``}
                         </td>
                         <td>
                             <div>${fmtAge(d.age_s)}</div>
                             <div class="muted" style="font-size:12px;" title="${fmtLastSeen(d.last_seen)}">${fmtLastSeen(d.last_seen)}</div>
                         </td>
-                        <td>${renderBatteryCell(battery)}</td>
+                        <td>${renderBatteryCell(battery, forcedLow)}</td>
                         <td>
-                            <div class="muted" style="font-size:12px;margin-bottom:6px;">${fmtGps(gps)}</div>
-                            ${renderMiniMap(gps)}
+                            <div class="muted" style="font-size:12px;">${fmtGps(gps)}</div>
+                            <div style="margin-top:8px;">
+                                <button class="mapBtn small subtle ${isLikelyLostPower(d) ? "alert" : ""}"
+                                    data-id="${d.device_id}"
+                                    data-name="${(d.name || "").toString().replace(/\"/g, '&quot;')}"
+                                    data-status="${statusLabel}"
+                                    data-last-seen="${d.last_seen || ''}"
+                                    data-battery="${battery ?? ''}"
+                                    data-force-low="${forcedLow ? "1" : "0"}">
+                                    ${isLikelyLostPower(d) ? "Last Known Location" : "View Location"}
+                                </button>
+                            </div>
                         </td>
                         <td>
                             <div class="row" style="gap:8px;">
                                 <button class="histBtn small" data-id="${d.device_id}" data-name="${(d.name || "").toString().replace(/\"/g, '&quot;')}">History</button>
                                 <button class="oobBtn small" data-id="${d.device_id}" data-force="${forced ? "1" : "0"}">${forced ? "Stop Forcing" : "Force OOB"}</button>
+                                <button class="lowBattBtn small" data-id="${d.device_id}" data-force="${forcedLow ? "1" : "0"}">${forcedLow ? "Stop Low Batt" : "Force Low Batt"}</button>
                                 <button class="delBtn small" data-id="${d.device_id}">Remove</button>
                             </div>
                         </td>
@@ -683,6 +796,7 @@
             try {
                 const devices = await fetchDevices();
                 renderDevices(devices);
+                maybeRefreshOpenMap(devices);
                 setPollPill(true);
             } catch (e) {
                 setPollPill(false);
@@ -711,12 +825,193 @@
             }
         }
 
+        function openTestPush() {
+            document.getElementById("testPushBackdrop").style.display = "flex";
+            document.getElementById("testPushStatus").textContent = "";
+            document.getElementById("testPushDeviceId").value = "";
+        }
+
+        function closeTestPush() {
+            document.getElementById("testPushBackdrop").style.display = "none";
+        }
+
+        async function sendTestPush() {
+            const statusEl = document.getElementById("testPushStatus");
+            const deviceId = document.getElementById("testPushDeviceId").value.trim();
+            const title = document.getElementById("testPushTitle").value.trim() || "Test alert";
+            const body = document.getElementById("testPushBody").value.trim() || "This is a test push notification from Base Station.";
+            const includeGlobal = document.getElementById("testPushIncludeGlobal").checked;
+
+            statusEl.textContent = "Sending…";
+            try {
+                const resp = await fetch("/notifications/test", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        device_id: deviceId || null,
+                        title,
+                        body,
+                        include_global: includeGlobal,
+                    }),
+                });
+                const payload = await resp.json().catch(() => ({}));
+                if (!resp.ok) {
+                    statusEl.textContent = payload?.message || payload?.error || "Send failed.";
+                    return;
+                }
+                const fcmOk = Number(payload.ok_count || 0);
+                const fcmSent = Number(payload.sent || 0);
+                const sbSent = Number(payload?.supabase?.sent || 0);
+                const sbFailed = Number(payload?.supabase?.failed || 0);
+                if (sbSent > 0 || sbFailed > 0) {
+                    statusEl.textContent = `FCM ${fcmOk}/${fcmSent}, Supabase ${sbSent} sent${sbFailed ? `, ${sbFailed} failed` : ""}.`;
+                } else {
+                    statusEl.textContent = `FCM ${fcmOk}/${fcmSent}.`;
+                }
+            } catch (_) {
+                statusEl.textContent = "Request failed.";
+            }
+        }
+
         function closePairing() {
             document.getElementById("pairingBackdrop").style.display = "none";
         }
 
         function closeHistory() {
             document.getElementById("historyBackdrop").style.display = "none";
+        }
+
+        function closeMapModal() {
+            document.getElementById("mapBackdrop").style.display = "none";
+            activeMapDeviceId = null;
+        }
+
+        function ensureLeafletMap() {
+            if (!window.L) return null;
+            if (!mapInstance) {
+                mapInstance = L.map("leafletMap", { zoomControl: true });
+                L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+                    maxZoom: 19,
+                    attribution: "&copy; OpenStreetMap contributors",
+                }).addTo(mapInstance);
+                mapLayerGroup = L.layerGroup().addTo(mapInstance);
+            }
+            return mapInstance;
+        }
+
+        function updateMapInfoPills({ status, lastSeenTs, battery, forceLow }) {
+            const statusPill = document.getElementById("mapStatusPill");
+            statusPill.textContent = `status: ${status || "unknown"}`;
+            statusPill.className = `pill ${status === "online" ? "online" : status === "critical" ? "critical" : "offline"}`;
+
+            const lastSeenPill = document.getElementById("mapLastSeenPill");
+            lastSeenPill.textContent = `last seen: ${lastSeenTs ? fmtLastSeen(Number(lastSeenTs)) : "—"}`;
+            lastSeenPill.className = "pill";
+
+            const batteryPill = document.getElementById("mapBatteryPill");
+            let btxt = fmtBattery(battery);
+            if (forceLow) btxt = `${btxt === "—" ? "9%" : btxt} (forced low)`;
+            batteryPill.textContent = `battery: ${btxt}`;
+            batteryPill.className = "pill";
+        }
+
+        async function renderMapForDevice(device, opts = { fitView: false }) {
+            const deviceId = device?.device_id;
+            if (!deviceId) return;
+            const deviceName = device?.name || deviceId;
+            const status = device?.force_low_battery ? "critical" : (device?.status || "unknown");
+            const lastSeenTs = device?.last_seen;
+            const battery = device?.data?.battery;
+            const forceLow = !!device?.force_low_battery;
+
+            const backdrop = document.getElementById("mapBackdrop");
+            backdrop.style.display = "flex";
+            document.getElementById("mapTitle").innerHTML = `<b>${deviceName}</b> <span class="muted">(${deviceId})</span>`;
+            updateMapInfoPills({ status, lastSeenTs, battery, forceLow });
+
+            const map = ensureLeafletMap();
+            if (!map) {
+                document.getElementById("mapTitle").innerHTML += ` <span class="muted">- Map library failed to load.</span>`;
+                return;
+            }
+
+            setTimeout(() => map.invalidateSize(), 80);
+            if (mapLayerGroup) mapLayerGroup.clearLayers();
+
+            try {
+                const resp = await fetch(`/history/${encodeURIComponent(deviceId)}?limit=400`, { cache: "no-store" });
+                if (!resp.ok) throw new Error("history_fetch_failed");
+                const payload = await resp.json();
+                const points = (payload.points || [])
+                    .map(p => ({ ...p, gps: gpsPointFromPayload({ lat: p.lat, lng: p.lng }) }))
+                    .filter(p => !!p.gps);
+
+                if (!points.length) {
+                    map.setView([10.6579, 122.9503], 16);
+                    return;
+                }
+
+                const latlngs = points.map(p => [p.gps.lat, p.gps.lng]);
+                const trail = latlngs.slice(Math.max(0, latlngs.length - 50));
+                L.polyline(trail, {
+                    color: "#2563eb",
+                    weight: 3,
+                    opacity: 0.85,
+                }).addTo(mapLayerGroup);
+
+                const last = points[points.length - 1];
+                const marker = L.marker([last.gps.lat, last.gps.lng]).addTo(mapLayerGroup);
+                marker.bindPopup(
+                    `<b>${deviceName || deviceId}</b><br/>Last point: ${new Date(last.ts * 1000).toLocaleString()}<br/>Battery: ${fmtBattery(last.battery)}`
+                );
+
+                if (opts.fitView && trail.length > 1) {
+                    map.fitBounds(trail, { padding: [24, 24] });
+                } else if (opts.fitView) {
+                    map.setView([last.gps.lat, last.gps.lng], 18);
+                }
+            } catch (_) {
+                // Keep modal open even if history fetch fails.
+                map.setView([10.6579, 122.9503], 16);
+            }
+        }
+
+        async function openMapModal(deviceId, deviceName, status, lastSeenTs, battery, forceLow) {
+            activeMapDeviceId = deviceId;
+            const device = {
+                device_id: deviceId,
+                name: deviceName,
+                status,
+                last_seen: lastSeenTs,
+                force_low_battery: forceLow,
+                data: { battery },
+            };
+            await renderMapForDevice(device, { fitView: true });
+        }
+
+        function maybeRefreshOpenMap(devices) {
+            if (!activeMapDeviceId) return;
+            const backdrop = document.getElementById("mapBackdrop");
+            if (!backdrop || backdrop.style.display !== "flex") return;
+
+            const device = (devices || []).find(d => d.device_id === activeMapDeviceId);
+            if (!device) return;
+
+            if (mapRefreshInFlight) {
+                mapRefreshQueued = true;
+                return;
+            }
+
+            mapRefreshInFlight = true;
+            renderMapForDevice(device, { fitView: false })
+                .catch(() => { })
+                .finally(() => {
+                    mapRefreshInFlight = false;
+                    if (mapRefreshQueued) {
+                        mapRefreshQueued = false;
+                        maybeRefreshOpenMap(lastDevices);
+                    }
+                });
         }
 
         function drawBattery(canvas, points) {
@@ -802,10 +1097,19 @@
                 const cfg = await fetchConfig();
                 currentConfig = cfg;
                 const bbox = cfg.gps_bbox || {};
+                const bboxSource = cfg.gps_bbox_source || "manual";
+                const bboxLocked = bboxSource === "shelter_boundary";
                 document.getElementById("cfgMinLat").value = (bbox.min_lat ?? "").toString();
                 document.getElementById("cfgMaxLat").value = (bbox.max_lat ?? "").toString();
                 document.getElementById("cfgMinLng").value = (bbox.min_lng ?? "").toString();
                 document.getElementById("cfgMaxLng").value = (bbox.max_lng ?? "").toString();
+                document.getElementById("cfgMinLat").disabled = bboxLocked;
+                document.getElementById("cfgMaxLat").disabled = bboxLocked;
+                document.getElementById("cfgMinLng").disabled = bboxLocked;
+                document.getElementById("cfgMaxLng").disabled = bboxLocked;
+                document.getElementById("bboxSourceHint").textContent = bboxLocked
+                    ? "Using shelter boundary bbox (managed from Supabase)."
+                    : "";
                 document.getElementById("cfgBatteryDrain").value = (cfg.battery_drain ?? "").toString();
                 document.getElementById("cfgBatteryLoop").checked = !!cfg.battery_loop;
                 document.getElementById("cfgStatus").textContent = "";
@@ -825,8 +1129,9 @@
             const maxLng = Number(document.getElementById("cfgMaxLng").value);
             const drain = Number(document.getElementById("cfgBatteryDrain").value);
             const loop = document.getElementById("cfgBatteryLoop").checked;
+            const bboxLocked = (currentConfig?.gps_bbox_source || "manual") === "shelter_boundary";
 
-            if (!Number.isFinite(minLat) || !Number.isFinite(maxLat) || !Number.isFinite(minLng) || !Number.isFinite(maxLng)) {
+            if (!bboxLocked && (!Number.isFinite(minLat) || !Number.isFinite(maxLat) || !Number.isFinite(minLng) || !Number.isFinite(maxLng))) {
                 status.textContent = "Please enter valid bbox numbers.";
                 return;
             }
@@ -842,7 +1147,9 @@
                     body: JSON.stringify({
                         config: {
                             gps_mode: "bbox",
-                            gps_bbox: { min_lat: minLat, max_lat: maxLat, min_lng: minLng, max_lng: maxLng },
+                            gps_bbox: bboxLocked
+                                ? (currentConfig?.gps_bbox || null)
+                                : { min_lat: minLat, max_lat: maxLat, min_lng: minLng, max_lng: maxLng },
                             battery_drain: Math.max(0, Math.round(drain)),
                             battery_loop: loop,
                         }
@@ -862,21 +1169,36 @@
             const statusEl = document.getElementById("pairingStatus");
             const ssid = document.getElementById("wifiSsid").value.trim();
             const password = document.getElementById("wifiPassword").value;
-            const name = document.getElementById("deviceName").value.trim();
+            let name = document.getElementById("deviceName").value.trim();
             const serverIp = document.getElementById("serverIp").value.trim();
 
             if (!ssid || !serverIp) {
                 statusEl.textContent = "Please fill WiFi SSID and Base Station IP.";
                 return;
             }
+            if (!name) {
+                const suffix = Math.floor(Math.random() * 9000 + 1000);
+                name = `Dog-${suffix}`;
+                document.getElementById("deviceName").value = name;
+            }
 
             statusEl.textContent = "Capturing current device list…";
             let known = new Set();
             try {
-                const before = await fetchDevices();
+                const before = await fetchDevices(true);
                 known = new Set(before.map(d => d.device_id));
             } catch (_) {
                 // If you're currently on the ESP32 AP already, this fetch may fail. That's OK.
+            }
+
+            try {
+                await fetch("/pairing/start", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ expected_name: name, ttl_s: 180 }),
+                });
+            } catch (_) {
+                // best effort: pairing can still proceed
             }
 
             statusEl.textContent = "Sending setup to ESP32 (192.168.4.1)…";
@@ -899,10 +1221,15 @@
 
             while (Date.now() - startedAt < timeoutMs) {
                 try {
-                    const devices = await fetchDevices();
+                    const devices = await fetchDevices(true);
                     renderDevices(devices);
                     for (const d of devices) {
                         if (!known.has(d.device_id)) {
+                            try {
+                                await fetch(`/device/${encodeURIComponent(d.device_id)}/claim`, { method: "POST" });
+                            } catch (_) {
+                                // best effort
+                            }
                             const display = d.name ? `${d.name} (${d.device_id})` : d.device_id;
                             statusEl.textContent = `Paired successfully: ${display}`;
                             setTimeout(closePairing, 800);
@@ -928,6 +1255,20 @@
             openHistory(btn.dataset.id, btn.dataset.name);
         });
 
+        // event delegation for location/map buttons
+        document.getElementById("deviceTbody").addEventListener("click", (e) => {
+            const btn = e.target.closest(".mapBtn");
+            if (!btn) return;
+            openMapModal(
+                btn.dataset.id,
+                btn.dataset.name,
+                btn.dataset.status,
+                btn.dataset.lastSeen,
+                btn.dataset.battery,
+                btn.dataset.forceLow === "1"
+            );
+        });
+
         // event delegation for force OOB
         document.getElementById("deviceTbody").addEventListener("click", async (e) => {
             const btn = e.target.closest(".oobBtn");
@@ -945,6 +1286,29 @@
                 if (!resp.ok) throw new Error("oob_failed");
             } catch (_) {
                 // no-op; next poll will refresh anyway
+            } finally {
+                btn.disabled = false;
+            }
+            pollLoop();
+        });
+
+        // event delegation for force low battery
+        document.getElementById("deviceTbody").addEventListener("click", async (e) => {
+            const btn = e.target.closest(".lowBattBtn");
+            if (!btn) return;
+            const deviceId = btn.dataset.id;
+            const forced = btn.dataset.force === "1";
+            btn.disabled = true;
+            btn.textContent = forced ? "Stopping…" : "Forcing…";
+            try {
+                const resp = await fetch(`/device/${encodeURIComponent(deviceId)}/low-battery`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ force: !forced }),
+                });
+                if (!resp.ok) throw new Error("low_batt_failed");
+            } catch (_) {
+                // no-op; polling will refresh state
             } finally {
                 btn.disabled = false;
             }
@@ -981,6 +1345,7 @@
             if (e.key !== "Escape") return;
             closePairing();
             closeHistory();
+            closeTestPush();
         });
 
         // click backdrop to close
@@ -989,6 +1354,12 @@
         });
         document.getElementById("historyBackdrop").addEventListener("click", (e) => {
             if (e.target.id === "historyBackdrop") closeHistory();
+        });
+        document.getElementById("mapBackdrop").addEventListener("click", (e) => {
+            if (e.target.id === "mapBackdrop") closeMapModal();
+        });
+        document.getElementById("testPushBackdrop").addEventListener("click", (e) => {
+            if (e.target.id === "testPushBackdrop") closeTestPush();
         });
     </script>
 </body>

@@ -40,6 +40,11 @@ Example:
 
 If you open it as `http://localhost:5000/`, the ESP32 will not be able to reach your computer.
 
+### Login flow
+- `/` now redirects to `/dashboard` after sign in.
+- If not signed in yet, you are redirected to `/shelter/login`.
+- Dashboard APIs are auth-guarded.
+
 ## 2) Upload the ESP32 sketch (Arduino IDE)
 
 ### Board
@@ -69,6 +74,12 @@ This is the “beginner friendly” pairing flow:
 7. The ESP32 restarts and connects to your WiFi
 8. It should show up in the dashboard within a few seconds
 
+### Shelter-specific ownership (important)
+- Devices are now scoped per shelter account.
+- When you click **Add Device**, the system creates a short “pairing claim” for your logged-in shelter user.
+- When that ESP32 starts posting data, it is auto-bound to your shelter.
+- Result: each shelter only sees/manages its own devices and gets notifications for its own devices.
+
 ### Reset / change WiFi (ESP32)
 If you want to pair again or you typed the wrong WiFi:
 - While the ESP32 is ON and running, press and hold **BOOT** for ~2–3 seconds.
@@ -81,6 +92,7 @@ The dashboard has controls you can change for the demo:
 - battery drain
 
 These settings are sent to the ESP32 automatically on the next update (the ESP32 reads the response from `POST /data`).
+If a shelter boundary exists in Supabase (`shelter_boundaries.polygon_geojson`), dashboard bbox is auto-derived from that boundary and manual bbox fields are locked.
 
 ## 5) Notifications (Firebase Cloud Messaging)
 
@@ -89,20 +101,31 @@ The base station can send:
 - **Low battery** notification (when `battery < 10%`)
 
 Important note: the “Force OOB” button is only a demo toggle. The base station sends a flag to the ESP32, and the ESP32 is the one that starts reporting GPS outside the bounding box (so the data flow stays realistic).
+Extra note: “Force Low Batt” is a server-side demo toggle (no ESP32 code change needed). It makes the dashboard/alerts treat the device as low battery for testing notifications.
+When Force Low Batt is enabled, the server also freezes that device's location to the last known GPS point, so the map does not keep moving during the low-power demo.
 
-### Setup (server side)
-1. Create a Firebase project and enable Cloud Messaging (FCM).
-2. Download a **service account JSON** file.
-3. Set environment variables before running `main.py`:
-   - `FCM_SERVICE_ACCOUNT_FILE=/absolute/path/to/service-account.json`
-   - Optional: `FCM_PROJECT_ID=<firebase_project_id>` (usually read from the JSON)
+### Setup (recommended, for your current mobile app)
+Your app is using **Expo push via Supabase**, so the easiest working path is:
 
-If you don’t set these, the system will still work, but it won’t be able to actually send the push notification.
+1. Keep your existing Supabase notification trigger setup.
+2. In Flask `.env`, set:
+   - `SUPABASE_URL=...`
+   - `SUPABASE_KEY=...`
+   - `SUPABASE_SERVICE_ROLE_KEY=...`  ← important for server-side inserts
+3. Flask inserts critical alerts into Supabase notifications; Supabase trigger sends push via Expo.
 
-### Setup (app side)
-Your mobile app should register its FCM token to the base station:
-- Endpoint: `POST /fcm/register`
-- Body:
-  - `{"token":"<fcm_token>","device_id":"<optional>","platform":"android"}`
+This is the current default bridge path for alerts.
 
-If `device_id` is omitted, that token will receive notifications for all devices.
+### Optional direct FCM path (advanced / parallel)
+You can still use direct Firebase send from Flask:
+- Set:
+  - `FCM_SERVICE_ACCOUNT_FILE=/absolute/path/to/service-account.json`
+  - Optional: `FCM_PROJECT_ID=<firebase_project_id>`
+- Register native FCM tokens to:
+  - `POST /fcm/register`
+  - body: `{"token":"<fcm_token>","device_id":"<optional>","platform":"android"}`
+
+### Quick test button
+Dashboard has **Test Push**:
+- sends test alerts
+- shows both channels in result (`FCM x/y`, `Supabase n sent`)
