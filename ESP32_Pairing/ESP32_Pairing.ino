@@ -4,13 +4,22 @@
 #include <Preferences.h>
 #include <ESPmDNS.h>
 #include <ArduinoJson.h>
+#include <HardwareSerial.h>
 
 // ----- User-adjustable (optional) -----
 static const int RESET_BUTTON_PIN = 0; // BOOT button on many ESP32 DevKit V1 boards
-static const unsigned long POST_INTERVAL_MS = 5000;
+static const unsigned long DEFAULT_POST_INTERVAL_MS = 5000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 5000;
 static const unsigned long WIFI_GIVEUP_MS = 30000;
 static const unsigned long RESET_HOLD_MS = 2500;
+static const int A9G_RX_PIN = 16; // ESP32 RX2 pin (reads from A9G TX)
+static const int A9G_TX_PIN = 17; // ESP32 TX2 pin (writes to A9G RX)
+static const unsigned long GPS_BOOT_LOCK_TIMEOUT_MS = 12000;
+static const unsigned long GPS_BOOT_POLL_INTERVAL_MS = 1500;
+static const unsigned long GPS_CMD_TIMEOUT_MS = 1500;
+
+const long A9G_BAUD_CANDIDATES[] = {115200, 9600, 57600, 38400, 19200};
+const size_t A9G_BAUD_COUNT = sizeof(A9G_BAUD_CANDIDATES) / sizeof(A9G_BAUD_CANDIDATES[0]);
 
 // ----- NVS keys -----
 static const char *PREF_NS = "cfg";
@@ -18,16 +27,19 @@ static const char *K_SSID = "ssid";
 static const char *K_PASS = "pass";
 static const char *K_SERVER = "server";
 static const char *K_NAME = "name";
+static const char *K_CLAIM = "claim";
 
 struct Config {
   String ssid;
   String pass;
   String serverIp;
   String name;
+  String claimToken;
 };
 
 Preferences prefs;
 WebServer web(80);
+HardwareSerial A9G(2);
 
 enum Mode { MODE_SETUP, MODE_NORMAL };
 Mode mode = MODE_SETUP;
@@ -38,6 +50,9 @@ String deviceId;
 unsigned long lastPostMs = 0;
 unsigned long lastWifiAttemptMs = 0;
 unsigned long wifiStartedMs = 0;
+unsigned long postIntervalMs = DEFAULT_POST_INTERVAL_MS;
+int gpsCheckEveryNPosts = 1;
+unsigned long postCounter = 0;
 
 struct MockConfig {
   float centerLat = 14.5995f;
@@ -59,6 +74,8 @@ float gpsLng = 0.0f;
 bool gpsInited = false;
 int batteryPct = 100;
 bool batteryInited = false;
+bool useRealGps = false;
+long a9gActiveBaud = 0;
 
 unsigned long resetHoldStartMs = 0;
 
@@ -94,6 +111,7 @@ static bool loadConfig(Config &out) {
   out.pass = prefs.getString(K_PASS, "");
   out.serverIp = prefs.getString(K_SERVER, "");
   out.name = prefs.getString(K_NAME, "");
+  out.claimToken = prefs.getString(K_CLAIM, "");
   prefs.end();
   return out.ssid.length() > 0 && out.serverIp.length() > 0;
 }
@@ -104,6 +122,7 @@ static void saveConfig(const Config &in) {
   prefs.putString(K_PASS, in.pass);
   prefs.putString(K_SERVER, in.serverIp);
   prefs.putString(K_NAME, in.name);
+  prefs.putString(K_CLAIM, in.claimToken);
   prefs.end();
 }
 
@@ -142,6 +161,7 @@ static void handleSetup() {
   String pass = "";
   String serverIp = "";
   String name = "";
+  String claimToken = "";
 
   String contentType = web.header("Content-Type");
   contentType.toLowerCase();
@@ -161,6 +181,7 @@ static void handleSetup() {
         serverIp = (const char *)(doc["serverIp"] | "");
       }
       name = (const char *)(doc["name"] | "");
+      claimToken = (const char *)(doc["claim_token"] | "");
     } else {
       Serial.printf("[SETUP] JSON parse error: %s\n", err.c_str());
     }
@@ -168,6 +189,7 @@ static void handleSetup() {
     ssid = web.arg("ssid");
     pass = web.arg("password");
     name = web.arg("name");
+    claimToken = web.arg("claim_token");
     serverIp = web.arg("server_ip");
 
     // Some clients forget to set Content-Type; try JSON anyway.
@@ -184,6 +206,7 @@ static void handleSetup() {
           serverIp = (const char *)(doc["server_ip"] | "");
           if (serverIp.length() == 0) serverIp = (const char *)(doc["serverIp"] | "");
           name = (const char *)(doc["name"] | "");
+          claimToken = (const char *)(doc["claim_token"] | "");
         } else {
           Serial.printf("[SETUP] fallback JSON parse error: %s\n", err.c_str());
         }
@@ -207,6 +230,7 @@ static void handleSetup() {
   newCfg.pass = pass;
   newCfg.serverIp = serverIp;
   newCfg.name = name.length() ? name : defaultNameFor(deviceId);
+  newCfg.claimToken = claimToken;
   saveConfig(newCfg);
 
   web.send(200, "application/json", "{\"status\":\"ok\"}");
@@ -246,6 +270,7 @@ static void beginNormalMode() {
   wifiStartedMs = millis();
   lastWifiAttemptMs = 0;
   lastPostMs = 0;
+  postCounter = 0;
 
   Serial.printf("[NORMAL] Connecting to WiFi SSID: %s\n", cfg.ssid.c_str());
 }
@@ -289,7 +314,7 @@ static float rand01() {
   return (float)esp_random() / (float)UINT32_MAX;
 }
 
-static void initMockStateIfNeeded() {
+static void initMockGpsIfNeeded() {
   if (!gpsInited) {
     if (mockCfg.useBbox && mockCfg.maxLat > mockCfg.minLat && mockCfg.maxLng > mockCfg.minLng) {
       float latSpan = mockCfg.maxLat - mockCfg.minLat;
@@ -321,7 +346,9 @@ static void initMockStateIfNeeded() {
     }
     gpsInited = true;
   }
+}
 
+static void initBatteryIfNeeded() {
   if (!batteryInited) {
     batteryPct = 100;
     batteryInited = true;
@@ -329,7 +356,7 @@ static void initMockStateIfNeeded() {
 }
 
 static void stepMockGps() {
-  initMockStateIfNeeded();
+  initMockGpsIfNeeded();
 
   if (mockCfg.useBbox && mockCfg.maxLat > mockCfg.minLat && mockCfg.maxLng > mockCfg.minLng) {
     float latSpan = mockCfg.maxLat - mockCfg.minLat;
@@ -404,12 +431,121 @@ static void stepMockGps() {
 }
 
 static void stepMockBattery() {
-  initMockStateIfNeeded();
+  initBatteryIfNeeded();
   batteryPct -= mockCfg.batteryDrain;
   if (batteryPct < 0) {
     batteryPct = mockCfg.batteryLoop ? 100 : 0;
   }
   if (batteryPct > 100) batteryPct = 100;
+}
+
+static String a9gSendCommand(const String &cmd, unsigned long timeoutMs) {
+  while (A9G.available()) A9G.read();
+  A9G.print(cmd);
+  A9G.print("\r\n");
+
+  String response = "";
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    while (A9G.available()) {
+      char c = (char)A9G.read();
+      response += c;
+    }
+    delay(2);
+  }
+  return response;
+}
+
+static bool detectA9GBaud() {
+  for (size_t i = 0; i < A9G_BAUD_COUNT; i++) {
+    long baud = A9G_BAUD_CANDIDATES[i];
+    A9G.end();
+    delay(60);
+    A9G.begin(baud, SERIAL_8N1, A9G_RX_PIN, A9G_TX_PIN);
+    delay(120);
+
+    String resp = a9gSendCommand("AT", 700);
+    if (resp.indexOf("OK") >= 0) {
+      a9gActiveBaud = baud;
+      return true;
+    }
+  }
+  a9gActiveBaud = 0;
+  return false;
+}
+
+static bool parseA9GLocation(const String &resp, float &lat, float &lng) {
+  if (resp.indexOf("GPS NOT FIX NOW") >= 0) return false;
+  if (resp.indexOf("+LOCATION:") < 0 && resp.indexOf("LOCATION:") < 0) return false;
+
+  int marker = resp.indexOf("+LOCATION:");
+  if (marker < 0) marker = resp.indexOf("LOCATION:");
+  if (marker < 0) return false;
+
+  String line = resp.substring(marker);
+  int lineEnd = line.indexOf('\n');
+  if (lineEnd >= 0) line = line.substring(0, lineEnd);
+  line.trim();
+
+  int colon = line.indexOf(':');
+  if (colon < 0) return false;
+  String values = line.substring(colon + 1);
+  values.trim();
+
+  int comma = values.indexOf(',');
+  if (comma < 0) return false;
+
+  String latStr = values.substring(0, comma);
+  String lngStr = values.substring(comma + 1);
+  int comma2 = lngStr.indexOf(',');
+  if (comma2 >= 0) lngStr = lngStr.substring(0, comma2);
+  latStr.trim();
+  lngStr.trim();
+
+  lat = latStr.toFloat();
+  lng = lngStr.toFloat();
+  return !(isnan(lat) || isnan(lng));
+}
+
+static bool fetchA9GGps(float &lat, float &lng) {
+  String resp = a9gSendCommand("AT+LOCATION=2", GPS_CMD_TIMEOUT_MS);
+  return parseA9GLocation(resp, lat, lng);
+}
+
+static bool shouldCheckGpsThisPost() {
+  int n = gpsCheckEveryNPosts;
+  if (n != 1 && n != 2 && n != 5) n = 1;
+  return (postCounter % (unsigned long)n) == 0;
+}
+
+static void initGpsSourceOnBoot() {
+  useRealGps = false;
+  Serial.println("[GPS] Boot check: probing A9G + GPS lock...");
+
+  if (!detectA9GBaud()) {
+    Serial.println("[GPS] A9G not detected. Using mock GPS.");
+    return;
+  }
+
+  Serial.printf("[GPS] A9G detected at baud %ld\n", a9gActiveBaud);
+  a9gSendCommand("ATE0", 600);
+  a9gSendCommand("AT+GPS=1", 1200);
+
+  unsigned long start = millis();
+  while (millis() - start < GPS_BOOT_LOCK_TIMEOUT_MS) {
+    float lat = 0.0f, lng = 0.0f;
+    if (fetchA9GGps(lat, lng)) {
+      useRealGps = true;
+      gpsLat = lat;
+      gpsLng = lng;
+      gpsInited = true;
+      Serial.printf("[GPS] GPS lock OK: %.6f, %.6f (using real GPS)\n", gpsLat, gpsLng);
+      return;
+    }
+    delay(GPS_BOOT_POLL_INTERVAL_MS);
+  }
+
+  Serial.println("[GPS] No GPS lock at boot timeout. Using mock GPS.");
 }
 
 static void applyConfigFromServer(const String &responseBody) {
@@ -469,8 +605,22 @@ static void applyConfigFromServer(const String &responseBody) {
   if (cfgObj.containsKey("battery_loop")) {
     mockCfg.batteryLoop = (bool)cfgObj["battery_loop"];
   }
+  if (cfgObj.containsKey("post_interval_min")) {
+    int minutes = cfgObj["post_interval_min"].as<int>();
+    if (minutes == 1 || minutes == 5 || minutes == 15 || minutes == 30) {
+      postIntervalMs = (unsigned long)minutes * 60UL * 1000UL;
+    }
+  }
+  if (cfgObj.containsKey("gps_check_every_n_posts")) {
+    int n = cfgObj["gps_check_every_n_posts"].as<int>();
+    if (n == 1 || n == 2 || n == 5) {
+      gpsCheckEveryNPosts = n;
+    }
+  }
 
   gpsInited = false; // re-seed after any GPS config change
+  Serial.printf("[CFG] post_interval_min=%lu gps_check_every_n_posts=%d\n",
+                postIntervalMs / 60000UL, gpsCheckEveryNPosts);
 }
 
 static void maybePostData() {
@@ -478,21 +628,52 @@ static void maybePostData() {
   if (WiFi.status() != WL_CONNECTED) return;
 
   unsigned long now = millis();
-  if (now - lastPostMs < POST_INTERVAL_MS) return;
+  if (now - lastPostMs < postIntervalMs) return;
   lastPostMs = now;
+  postCounter++;
 
-  initMockStateIfNeeded();
-  stepMockGps();
+  bool checkGpsNow = shouldCheckGpsThisPost();
+
+  if (useRealGps) {
+    if (checkGpsNow) {
+      float lat = 0.0f, lng = 0.0f;
+      if (fetchA9GGps(lat, lng)) {
+        gpsLat = lat;
+        gpsLng = lng;
+      } else {
+        Serial.println("[GPS] Real GPS read failed. Keeping last known coordinate.");
+      }
+    }
+  } else {
+    bool promotedToReal = false;
+    if (checkGpsNow) {
+      float lat = 0.0f, lng = 0.0f;
+      if (fetchA9GGps(lat, lng)) {
+        useRealGps = true;
+        gpsLat = lat;
+        gpsLng = lng;
+        gpsInited = true;
+        promotedToReal = true;
+        Serial.printf("[GPS] Runtime lock acquired: %.6f, %.6f (switching to real GPS)\n", gpsLat, gpsLng);
+      }
+    }
+    if (!promotedToReal) {
+      initMockGpsIfNeeded();
+      stepMockGps();
+    }
+  }
   stepMockBattery();
 
   String url = String("http://") + cfg.serverIp + ":5000/data";
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<384> doc;
   doc["device_id"] = deviceId;
   doc["name"] = cfg.name.length() ? cfg.name : defaultNameFor(deviceId);
+  if (cfg.claimToken.length()) doc["claim_token"] = cfg.claimToken;
   doc["status"] = "online";
   JsonObject gps = doc.createNestedObject("gps");
   gps["lat"] = gpsLat;
   gps["lng"] = gpsLng;
+  doc["gps_source"] = useRealGps ? "a9g" : "mock";
   doc["battery"] = batteryPct;
 
   String payload;
@@ -514,7 +695,8 @@ static void maybePostData() {
   http.end();
 
   if (code > 0) {
-    Serial.printf("[NORMAL] POST /data -> %d\n", code);
+    Serial.printf("[NORMAL] POST /data -> %d (interval=%lums gps_check_every=%d)\n",
+                  code, postIntervalMs, gpsCheckEveryNPosts);
   } else {
     Serial.printf("[NORMAL] POST /data failed: %d\n", code);
   }
@@ -577,6 +759,7 @@ void setup() {
   }
 
   Serial.printf("[BOOT] Config found. SSID=%s server_ip=%s\n", cfg.ssid.c_str(), cfg.serverIp.c_str());
+  initGpsSourceOnBoot();
   normalMode();
 }
 

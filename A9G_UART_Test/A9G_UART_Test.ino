@@ -5,13 +5,13 @@
 // ESP32 GPIO17 (TX2) -> A9G RX
 // ESP32 GPIO16 (RX2) -> A9G TX
 
-static const int A9G_RX_PIN = 16;      // ESP32 RX2 pin (reads data from A9G TX)
-static const int A9G_TX_PIN = 17;      // ESP32 TX2 pin (sends data to A9G RX)
-static const long USB_BAUD = 115200;   // Serial Monitor baud
+static const int A9G_RX_PIN = 16;     // ESP32 RX2 pin (reads data from A9G TX)
+static const int A9G_TX_PIN = 17;     // ESP32 TX2 pin (sends data to A9G RX)
+static const long USB_BAUD = 115200;  // Serial Monitor baud
 
 HardwareSerial A9G(2);
 
-const long BAUD_CANDIDATES[] = {115200, 9600, 57600, 38400, 19200};
+const long BAUD_CANDIDATES[] = { 115200, 9600, 57600, 38400, 19200 };
 const size_t BAUD_COUNT = sizeof(BAUD_CANDIDATES) / sizeof(BAUD_CANDIDATES[0]);
 
 long activeBaud = 0;

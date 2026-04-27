@@ -58,6 +58,30 @@ In Arduino IDE → Library Manager, install:
 Open this sketch and upload it:
 - `/Users/macbookair/thesis/basestation_flask/ESP32_Pairing/ESP32_Pairing.ino`
 
+### Optional: A9G UART test sketch
+If you want to test A9G module connection first, upload:
+- `/Users/macbookair/thesis/basestation_flask/A9G_UART_Test/A9G_UART_Test.ino`
+
+Default UART wiring used by this test:
+- ESP32 `GPIO17 (TX2)` -> A9G `RX` (AT UART)
+- ESP32 `GPIO16 (RX2)` -> A9G `TX` (AT UART)
+- shared `GND`
+
+Open Serial Monitor at `115200` baud, then try these commands:
+- `AT` (basic response check)
+- `ATE0` (turn off echo)
+- `AT+CSQ` (signal quality)
+- `AT+GPS=1` (turn GPS on)
+- `AT+GPSRD=1` (start NMEA stream)
+- `AT+LOCATION=2` (read parsed location; may say `GPS NOT FIX NOW` until lock)
+- `AT+GPSRD=0` (stop NMEA stream)
+- `AT+GPS=0` (turn GPS off)
+
+GPS lock tips:
+- First lock can take a few minutes.
+- Test outdoors with clear sky view.
+- Weak power or bad antenna placement can cause unstable/no lock.
+
 ## 3) Pair / Add Device (SoftAP provisioning)
 
 This is the “beginner friendly” pairing flow:

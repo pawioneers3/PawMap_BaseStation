@@ -458,6 +458,23 @@
                         <div style="font-size:12px;color:var(--muted);">Battery Drain / Update</div>
                         <input id="cfgBatteryDrain" style="width:180px;" />
                     </div>
+                    <div>
+                        <div style="font-size:12px;color:var(--muted);">Send Interval</div>
+                        <select id="cfgPostIntervalMin" style="width:180px;padding:10px;border-radius:10px;border:1px solid var(--border);">
+                            <option value="1">Every 1 minute</option>
+                            <option value="5">Every 5 minutes</option>
+                            <option value="15">Every 15 minutes</option>
+                            <option value="30">Every 30 minutes</option>
+                        </select>
+                    </div>
+                    <div>
+                        <div style="font-size:12px;color:var(--muted);">GPS Check Frequency</div>
+                        <select id="cfgGpsCheckEvery" style="width:200px;padding:10px;border-radius:10px;border:1px solid var(--border);">
+                            <option value="1">Every request</option>
+                            <option value="2">Every other request</option>
+                            <option value="5">Every 5 requests</option>
+                        </select>
+                    </div>
                     <div style="display:flex;align-items:flex-end;gap:8px;">
                         <label style="font-size:13px;user-select:none;color:rgba(229,231,235,0.9);">
                             <input type="checkbox" id="cfgBatteryLoop" /> Loop battery (0 → 100)
@@ -508,6 +525,17 @@
                 <span class="pill" id="mapStatusPill">status: —</span>
                 <span class="pill" id="mapLastSeenPill">last seen: —</span>
                 <span class="pill" id="mapBatteryPill">battery: —</span>
+                <span class="pill" id="mapGpsSourcePill">gps source: —</span>
+                <label class="pill" style="display:flex;align-items:center;gap:8px;">
+                    trail points
+                    <select id="mapTrailSelect" style="margin:0;padding:4px 6px;border-radius:8px;">
+                        <option value="10">10</option>
+                        <option value="20">20</option>
+                        <option value="30" selected>30</option>
+                        <option value="40">40</option>
+                        <option value="50">50</option>
+                    </select>
+                </label>
             </div>
         </div>
     </div>
@@ -666,6 +694,17 @@
             return `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
         }
 
+        function gpsSourceInfo(device) {
+            const raw = (device?.data?.gps_source || "").toString().toLowerCase();
+            if (raw === "a9g" || raw === "real") {
+                return { key: "real", label: "GPS: real", className: "online", detail: "Using A9G GPS lock" };
+            }
+            if (raw === "mock") {
+                return { key: "mock", label: "GPS: mock", className: "warn", detail: "Using simulated GPS (no satellite fix yet)" };
+            }
+            return { key: "unknown", label: "GPS: unknown", className: "info", detail: "No gps_source flag from device payload" };
+        }
+
         function clamp(v, lo, hi) {
             return Math.max(lo, Math.min(hi, v));
         }
@@ -675,6 +714,26 @@
             const lng = Number(p?.lng);
             if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
             return { lat, lng };
+        }
+
+        function mapTrailLimit() {
+            const raw = Number(document.getElementById("mapTrailSelect")?.value || 30);
+            if (!Number.isFinite(raw)) return 30;
+            const n = Math.round(raw / 10) * 10;
+            return Math.max(10, Math.min(50, n));
+        }
+
+        function activeBboxFromConfig() {
+            const cfg = currentConfig || {};
+            if ((cfg.gps_mode || "").toString().toLowerCase() !== "bbox") return null;
+            const bbox = cfg.gps_bbox || {};
+            const minLat = Number(bbox.min_lat);
+            const maxLat = Number(bbox.max_lat);
+            const minLng = Number(bbox.min_lng);
+            const maxLng = Number(bbox.max_lng);
+            if (![minLat, maxLat, minLng, maxLng].every(Number.isFinite)) return null;
+            if (!(maxLat > minLat && maxLng > minLng)) return null;
+            return { minLat, maxLat, minLng, maxLng };
         }
 
         function isLikelyLostPower(device) {
@@ -736,6 +795,7 @@
                 const statusLabel = displayStatus === "critical" ? "critical" : (d.status === "online" ? "online" : "offline");
                 const battery = d.data ? d.data.battery : undefined;
                 const gps = d.data ? d.data.gps : undefined;
+                const gpsSource = gpsSourceInfo(d);
                 const gf = d.geofence || {};
                 const out = gf.out_of_bounds === true;
                 const forced = d.force_oob === true;
@@ -765,6 +825,9 @@
                         <td>${renderBatteryCell(battery, forcedLow)}</td>
                         <td>
                             <div class="muted" style="font-size:12px;">${fmtGps(gps)}</div>
+                            <div style="margin-top:6px;">
+                                <span class="pill ${gpsSource.className}" title="${gpsSource.detail}">${gpsSource.label}</span>
+                            </div>
                             <div style="margin-top:8px;">
                                 <button class="mapBtn small subtle ${isLikelyLostPower(d) ? "alert" : ""}"
                                     data-id="${d.device_id}"
@@ -772,6 +835,7 @@
                                     data-status="${statusLabel}"
                                     data-last-seen="${d.last_seen || ''}"
                                     data-battery="${battery ?? ''}"
+                                    data-gps-source="${gpsSource.key}"
                                     data-force-low="${forcedLow ? "1" : "0"}">
                                     ${isLikelyLostPower(d) ? "Last Known Location" : "View Location"}
                                 </button>
@@ -899,7 +963,7 @@
             return mapInstance;
         }
 
-        function updateMapInfoPills({ status, lastSeenTs, battery, forceLow }) {
+        function updateMapInfoPills({ status, lastSeenTs, battery, forceLow, gpsSource }) {
             const statusPill = document.getElementById("mapStatusPill");
             statusPill.textContent = `status: ${status || "unknown"}`;
             statusPill.className = `pill ${status === "online" ? "online" : status === "critical" ? "critical" : "offline"}`;
@@ -913,6 +977,11 @@
             if (forceLow) btxt = `${btxt === "—" ? "9%" : btxt} (forced low)`;
             batteryPill.textContent = `battery: ${btxt}`;
             batteryPill.className = "pill";
+
+            const sourcePill = document.getElementById("mapGpsSourcePill");
+            const source = (gpsSource || "unknown").toString().toLowerCase();
+            sourcePill.textContent = `gps source: ${source}`;
+            sourcePill.className = `pill ${source === "real" ? "online" : source === "mock" ? "warn" : "info"}`;
         }
 
         async function renderMapForDevice(device, opts = { fitView: false }) {
@@ -923,11 +992,12 @@
             const lastSeenTs = device?.last_seen;
             const battery = device?.data?.battery;
             const forceLow = !!device?.force_low_battery;
+            const gpsSource = gpsSourceInfo(device).key;
 
             const backdrop = document.getElementById("mapBackdrop");
             backdrop.style.display = "flex";
             document.getElementById("mapTitle").innerHTML = `<b>${deviceName}</b> <span class="muted">(${deviceId})</span>`;
-            updateMapInfoPills({ status, lastSeenTs, battery, forceLow });
+            updateMapInfoPills({ status, lastSeenTs, battery, forceLow, gpsSource });
 
             const map = ensureLeafletMap();
             if (!map) {
@@ -952,12 +1022,26 @@
                 }
 
                 const latlngs = points.map(p => [p.gps.lat, p.gps.lng]);
-                const trail = latlngs.slice(Math.max(0, latlngs.length - 50));
+                const trail = latlngs.slice(Math.max(0, latlngs.length - mapTrailLimit()));
                 L.polyline(trail, {
                     color: "#2563eb",
                     weight: 3,
                     opacity: 0.85,
                 }).addTo(mapLayerGroup);
+
+                const bbox = activeBboxFromConfig();
+                if (bbox) {
+                    L.rectangle(
+                        [[bbox.minLat, bbox.minLng], [bbox.maxLat, bbox.maxLng]],
+                        {
+                            color: "#16a34a",
+                            weight: 2,
+                            opacity: 0.95,
+                            fill: false,
+                            dashArray: "6,6",
+                        }
+                    ).addTo(mapLayerGroup);
+                }
 
                 const last = points[points.length - 1];
                 const marker = L.marker([last.gps.lat, last.gps.lng]).addTo(mapLayerGroup);
@@ -976,7 +1060,7 @@
             }
         }
 
-        async function openMapModal(deviceId, deviceName, status, lastSeenTs, battery, forceLow) {
+        async function openMapModal(deviceId, deviceName, status, lastSeenTs, battery, forceLow, gpsSource) {
             activeMapDeviceId = deviceId;
             const device = {
                 device_id: deviceId,
@@ -984,7 +1068,7 @@
                 status,
                 last_seen: lastSeenTs,
                 force_low_battery: forceLow,
-                data: { battery },
+                data: { battery, gps_source: gpsSource },
             };
             await renderMapForDevice(device, { fitView: true });
         }
@@ -1112,6 +1196,10 @@
                     : "";
                 document.getElementById("cfgBatteryDrain").value = (cfg.battery_drain ?? "").toString();
                 document.getElementById("cfgBatteryLoop").checked = !!cfg.battery_loop;
+                const postIntervalMin = Number(cfg.post_interval_min ?? 1);
+                document.getElementById("cfgPostIntervalMin").value = [1, 5, 15, 30].includes(postIntervalMin) ? String(postIntervalMin) : "1";
+                const gpsCheckEvery = Number(cfg.gps_check_every_n_posts ?? 1);
+                document.getElementById("cfgGpsCheckEvery").value = [1, 2, 5].includes(gpsCheckEvery) ? String(gpsCheckEvery) : "1";
                 document.getElementById("cfgStatus").textContent = "";
                 if (lastDevices.length) renderDevices(lastDevices);
             } catch (_) {
@@ -1129,6 +1217,8 @@
             const maxLng = Number(document.getElementById("cfgMaxLng").value);
             const drain = Number(document.getElementById("cfgBatteryDrain").value);
             const loop = document.getElementById("cfgBatteryLoop").checked;
+            const postIntervalMin = Number(document.getElementById("cfgPostIntervalMin").value);
+            const gpsCheckEvery = Number(document.getElementById("cfgGpsCheckEvery").value);
             const bboxLocked = (currentConfig?.gps_bbox_source || "manual") === "shelter_boundary";
 
             if (!bboxLocked && (!Number.isFinite(minLat) || !Number.isFinite(maxLat) || !Number.isFinite(minLng) || !Number.isFinite(maxLng))) {
@@ -1137,6 +1227,14 @@
             }
             if (!Number.isFinite(drain)) {
                 status.textContent = "Please enter valid battery drain.";
+                return;
+            }
+            if (![1, 5, 15, 30].includes(postIntervalMin)) {
+                status.textContent = "Invalid send interval.";
+                return;
+            }
+            if (![1, 2, 5].includes(gpsCheckEvery)) {
+                status.textContent = "Invalid GPS check frequency.";
                 return;
             }
 
@@ -1152,6 +1250,8 @@
                                 : { min_lat: minLat, max_lat: maxLat, min_lng: minLng, max_lng: maxLng },
                             battery_drain: Math.max(0, Math.round(drain)),
                             battery_loop: loop,
+                            post_interval_min: postIntervalMin,
+                            gps_check_every_n_posts: gpsCheckEvery,
                         }
                     })
                 });
@@ -1184,6 +1284,7 @@
 
             statusEl.textContent = "Capturing current device list…";
             let known = new Set();
+            let claimToken = null;
             try {
                 const before = await fetchDevices(true);
                 known = new Set(before.map(d => d.device_id));
@@ -1192,11 +1293,13 @@
             }
 
             try {
-                await fetch("/pairing/start", {
+                const claimResp = await fetch("/pairing/start", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ expected_name: name, ttl_s: 180 }),
                 });
+                const claimJson = await claimResp.json().catch(() => ({}));
+                claimToken = claimJson?.claim_token || null;
             } catch (_) {
                 // best effort: pairing can still proceed
             }
@@ -1206,7 +1309,7 @@
                 const resp = await fetch("http://192.168.4.1/setup", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ ssid, password, server_ip: serverIp, name }),
+                    body: JSON.stringify({ ssid, password, server_ip: serverIp, name, claim_token: claimToken }),
                 });
                 if (!resp.ok) throw new Error("setup_failed");
             } catch (e) {
@@ -1223,8 +1326,12 @@
                 try {
                     const devices = await fetchDevices(true);
                     renderDevices(devices);
+                    const expectedName = (name || "").trim().toLowerCase();
                     for (const d of devices) {
-                        if (!known.has(d.device_id)) {
+                        const deviceNameLc = (d.name || "").toString().trim().toLowerCase();
+                        const isNewDevice = !known.has(d.device_id);
+                        const isExpectedNameMatch = !!expectedName && deviceNameLc === expectedName;
+                        if (isNewDevice || isExpectedNameMatch) {
                             try {
                                 await fetch(`/device/${encodeURIComponent(d.device_id)}/claim`, { method: "POST" });
                             } catch (_) {
@@ -1265,7 +1372,8 @@
                 btn.dataset.status,
                 btn.dataset.lastSeen,
                 btn.dataset.battery,
-                btn.dataset.forceLow === "1"
+                btn.dataset.forceLow === "1",
+                btn.dataset.gpsSource
             );
         });
 
@@ -1357,6 +1465,9 @@
         });
         document.getElementById("mapBackdrop").addEventListener("click", (e) => {
             if (e.target.id === "mapBackdrop") closeMapModal();
+        });
+        document.getElementById("mapTrailSelect").addEventListener("change", () => {
+            maybeRefreshOpenMap(lastDevices);
         });
         document.getElementById("testPushBackdrop").addEventListener("click", (e) => {
             if (e.target.id === "testPushBackdrop") closeTestPush();

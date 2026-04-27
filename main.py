@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sqlite3
 import time
 from functools import wraps
@@ -38,7 +39,6 @@ if create_client and SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
     except Exception:
         supabase_admin_client = None
 
-HEARTBEAT_TIMEOUT_S = 10
 DB_PATH = Path(__file__).resolve().with_name("basestation.db")
 NOTIFY_COOLDOWN_S = 60
 BATTERY_LOW_THRESHOLD = 10
@@ -57,6 +57,8 @@ server_config: dict[str, Any] = {
     "gps_mode": "bbox",  # "radius" | "bbox"
     "battery_drain": 1,
     "battery_loop": True,
+    "post_interval_min": 1,  # 1 | 5 | 15 | 30
+    "gps_check_every_n_posts": 1,  # 1 | 2 | 5
 }
 
 
@@ -115,6 +117,7 @@ def _init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT NOT NULL,
                 expected_name TEXT NOT NULL,
+                claim_token TEXT,
                 created_at REAL NOT NULL,
                 expires_at REAL NOT NULL,
                 claimed_device_id TEXT,
@@ -190,6 +193,19 @@ def _init_db() -> None:
         # Best-effort migrations for existing DBs.
         try:
             conn.execute("ALTER TABLE devices ADD COLUMN shelter_user_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE pairing_claims ADD COLUMN claim_token TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_pairing_claims_token
+                ON pairing_claims(claim_token)
+                """
+            )
         except sqlite3.OperationalError:
             pass
         try:
@@ -471,6 +487,28 @@ def _resolve_pending_claim_user_id(incoming_name: str, now_ts: float) -> Optiona
         return str(row["user_id"])
 
 
+def _resolve_pending_claim_user_id_by_token(claim_token: str, now_ts: float) -> Optional[str]:
+    if not claim_token:
+        return None
+    with _db() as conn:
+        row = conn.execute(
+            """
+            SELECT id, user_id
+            FROM pairing_claims
+            WHERE claim_token = ?
+              AND claimed_at IS NULL
+              AND expires_at >= ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (claim_token, now_ts),
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute("UPDATE pairing_claims SET claimed_at = ? WHERE id = ?", (now_ts, row["id"]))
+        return str(row["user_id"])
+
+
 def _supabase_target_user_ids_for_alerts(device_id: Optional[str] = None) -> list[str]:
     # Optional explicit override to keep demo routing simple.
     env_ids = (os.environ.get("SUPABASE_NOTIFY_USER_IDS") or "").strip()
@@ -668,6 +706,20 @@ def _device_view(
     entry: dict[str, Any],
     geofence_config: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
+    active_cfg = geofence_config or server_config
+    post_interval_min = _coerce_int(active_cfg.get("post_interval_min"), 1)
+    if post_interval_min not in (1, 5, 15, 30):
+        post_interval_min = 1
+    # Keep a wider grace window so dashboard doesn't flap offline for long intervals.
+    # Requested behavior:
+    # - 1 min send interval -> offline after 5 minutes
+    # - 5 min send interval -> offline after 10 minutes
+    # For higher intervals, use interval + 5 minutes.
+    if post_interval_min == 1:
+        offline_timeout_s = 5 * 60
+    else:
+        offline_timeout_s = (post_interval_min + 5) * 60
+
     last_seen = float(entry.get("last_seen", 0.0))
     data = entry.get("data") or {}
     name = entry.get("name") or data.get("name") or _default_name(device_id)
@@ -677,7 +729,7 @@ def _device_view(
     freeze_lng = entry.get("freeze_lng")
     age_s = max(0.0, time.time() - last_seen) if last_seen else None
     status = "offline"
-    if last_seen and age_s is not None and age_s <= HEARTBEAT_TIMEOUT_S:
+    if last_seen and age_s is not None and age_s <= offline_timeout_s:
         status = "online"
     return {
         "device_id": device_id,
@@ -1148,6 +1200,19 @@ def set_config():
     )
     server_config["battery_loop"] = bool(cfg.get("battery_loop", server_config["battery_loop"]))
 
+    post_interval_min = _coerce_int(cfg.get("post_interval_min"), int(server_config.get("post_interval_min", 1)))
+    if post_interval_min not in (1, 5, 15, 30):
+        post_interval_min = 1
+    server_config["post_interval_min"] = post_interval_min
+
+    gps_check_every_n_posts = _coerce_int(
+        cfg.get("gps_check_every_n_posts"),
+        int(server_config.get("gps_check_every_n_posts", 1)),
+    )
+    if gps_check_every_n_posts not in (1, 2, 5):
+        gps_check_every_n_posts = 1
+    server_config["gps_check_every_n_posts"] = gps_check_every_n_posts
+
     _save_server_config()
     return jsonify({"status": "ok", "config": _effective_server_config_for_request()})
 
@@ -1171,17 +1236,25 @@ def pairing_start():
 
     now = time.time()
     expires_at = now + ttl_s
+    claim_token = secrets.token_hex(8)
     with _db() as conn:
         # Best-effort cleanup.
         conn.execute("DELETE FROM pairing_claims WHERE expires_at < ? OR claimed_at IS NOT NULL", (now,))
         conn.execute(
             """
-            INSERT INTO pairing_claims(user_id, expected_name, created_at, expires_at)
-            VALUES(?, ?, ?, ?)
+            INSERT INTO pairing_claims(user_id, expected_name, claim_token, created_at, expires_at)
+            VALUES(?, ?, ?, ?, ?)
             """,
-            (user_id, expected_name, now, expires_at),
+            (user_id, expected_name, claim_token, now, expires_at),
         )
-    return jsonify({"status": "ok", "expected_name": expected_name, "expires_at": expires_at})
+    return jsonify(
+        {
+            "status": "ok",
+            "expected_name": expected_name,
+            "claim_token": claim_token,
+            "expires_at": expires_at,
+        }
+    )
 
 
 @app.post("/data")
@@ -1196,6 +1269,7 @@ def receive_data():
 
     # Backward compatible: name/gps/battery may be missing.
     incoming_name = str(data.get("name") or "").strip()
+    incoming_claim_token = str(data.get("claim_token") or "").strip()
 
     now = time.time()
     notify_tokens: list[str] = []
@@ -1230,6 +1304,8 @@ def receive_data():
         name = incoming_name or stored_name or _default_name(device_id)
         force_oob_bool = bool(force_oob)
 
+        if not shelter_user_id and incoming_claim_token:
+            shelter_user_id = _resolve_pending_claim_user_id_by_token(incoming_claim_token, now)
         if not shelter_user_id:
             shelter_user_id = _resolve_pending_claim_user_id(name, now)
 
@@ -1253,9 +1329,11 @@ def receive_data():
                 """
                 UPDATE pairing_claims
                 SET claimed_device_id = ?, claimed_at = COALESCE(claimed_at, ?)
-                WHERE user_id = ? AND expected_name = ? AND claimed_device_id IS NULL
+                WHERE user_id = ?
+                  AND claimed_device_id IS NULL
+                  AND (claim_token = ? OR expected_name = ?)
                 """,
-                (device_id, now, shelter_user_id, name),
+                (device_id, now, shelter_user_id, incoming_claim_token, name),
             )
 
         gps = data.get("gps") if isinstance(data.get("gps"), dict) else {}
