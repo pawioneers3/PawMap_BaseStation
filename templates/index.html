@@ -898,7 +898,20 @@
             const lat = Number(p?.lat);
             const lng = Number(p?.lng);
             if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+            if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
             return { lat, lng };
+        }
+
+        function distanceMeters(a, b) {
+            const r = 6371000;
+            const toRad = deg => deg * Math.PI / 180;
+            const dLat = toRad(b.lat - a.lat);
+            const dLng = toRad(b.lng - a.lng);
+            const lat1 = toRad(a.lat);
+            const lat2 = toRad(b.lat);
+            const h = Math.sin(dLat / 2) ** 2
+                + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+            return 2 * r * Math.asin(Math.min(1, Math.sqrt(h)));
         }
 
         function mapTrailLimit() {
@@ -919,6 +932,31 @@
             if (![minLat, maxLat, minLng, maxLng].every(Number.isFinite)) return null;
             if (!(maxLat > minLat && maxLng > minLng)) return null;
             return { minLat, maxLat, minLng, maxLng };
+        }
+
+        function mapJumpLimitMeters(bbox) {
+            if (!bbox) return 2000;
+            const diagonal = distanceMeters(
+                { lat: bbox.minLat, lng: bbox.minLng },
+                { lat: bbox.maxLat, lng: bbox.maxLng }
+            );
+            return clamp(diagonal * 8, 500, 5000);
+        }
+
+        function recentContinuousTrail(points, bbox) {
+            const limit = mapTrailLimit();
+            const jumpLimit = mapJumpLimitMeters(bbox);
+            const kept = [];
+            for (let i = points.length - 1; i >= 0 && kept.length < limit; i--) {
+                const current = points[i];
+                if (!current?.gps) continue;
+                if (kept.length) {
+                    const previous = kept[kept.length - 1];
+                    if (distanceMeters(current.gps, previous.gps) > jumpLimit) break;
+                }
+                kept.push(current);
+            }
+            return kept.reverse();
         }
 
         function isLikelyLostPower(device) {
@@ -1208,15 +1246,17 @@
                     return;
                 }
 
-                const latlngs = points.map(p => [p.gps.lat, p.gps.lng]);
-                const trail = latlngs.slice(Math.max(0, latlngs.length - mapTrailLimit()));
-                L.polyline(trail, {
-                    color: "#2563eb",
-                    weight: 3,
-                    opacity: 0.85,
-                }).addTo(mapLayerGroup);
-
                 const bbox = activeBboxFromConfig();
+                const trailPoints = recentContinuousTrail(points, bbox);
+                const trail = trailPoints.map(p => [p.gps.lat, p.gps.lng]);
+                if (trail.length > 1) {
+                    L.polyline(trail, {
+                        color: "#2563eb",
+                        weight: 3,
+                        opacity: 0.85,
+                    }).addTo(mapLayerGroup);
+                }
+
                 if (bbox) {
                     L.rectangle(
                         [[bbox.minLat, bbox.minLng], [bbox.maxLat, bbox.maxLng]],

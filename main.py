@@ -915,12 +915,10 @@ def _shelter_boundary_bbox(user_id: str) -> Optional[dict[str, float]]:
         return None
 
 
-def _effective_server_config_for_request() -> dict[str, Any]:
+def _effective_server_config_for_user(user_id: Optional[str]) -> dict[str, Any]:
     effective = dict(server_config)
     effective["gps_bbox_source"] = "manual"
 
-    user = getattr(request, "user", None)
-    user_id = getattr(user, "id", None) if user else None
     if user_id:
         boundary_bbox = _shelter_boundary_bbox(str(user_id))
         if boundary_bbox:
@@ -928,6 +926,12 @@ def _effective_server_config_for_request() -> dict[str, Any]:
             effective["gps_bbox"] = boundary_bbox
             effective["gps_bbox_source"] = "shelter_boundary"
     return effective
+
+
+def _effective_server_config_for_request() -> dict[str, Any]:
+    user = getattr(request, "user", None)
+    user_id = getattr(user, "id", None) if user else None
+    return _effective_server_config_for_user(str(user_id) if user_id else None)
 
 
 def require_web_session_page(fn):
@@ -1426,7 +1430,8 @@ def receive_data():
         )
 
         # Update last_oob + possibly trigger notification.
-        geofence = _compute_geofence(data)
+        geofence_config = _effective_server_config_for_user(shelter_user_id)
+        geofence = _compute_geofence(data, geofence_config)
         out = geofence.get("out_of_bounds")
         out_i = 1 if out is True else 0 if out is False else None
         conn.execute(
@@ -1505,7 +1510,7 @@ def receive_data():
                 (now, device_id),
             )
 
-    response_config = dict(server_config)
+    response_config = _effective_server_config_for_user(shelter_user_id)
     response_config["force_oob"] = bool(force_oob)
 
     if should_notify:
