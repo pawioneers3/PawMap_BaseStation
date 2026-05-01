@@ -1,69 +1,303 @@
 <!doctype html>
 <html lang="en">
 <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Shelter Auth Portal</title>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 960px; margin: 32px auto; padding: 0 16px; background: #f7f7fb; }
-        .navbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
-        .nav-links { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-        .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; }
-        label { display: block; font-size: 13px; margin-top: 10px; color: #374151; }
-        input { width: 100%; box-sizing: border-box; margin-top: 6px; padding: 10px; border: 1px solid #d1d5db; border-radius: 8px; }
-        button { margin-top: 12px; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px; background: #111827; color: #fff; cursor: pointer; }
-        a.btn { text-decoration: none; border: 1px solid #d1d5db; border-radius: 8px; padding: 8px 10px; color: #111827; background: #fff; }
-        .pill { display:inline-block; border:1px solid #e5e7eb; background:#fff; color:#374151; border-radius:999px; padding:4px 8px; font-size:12px; }
-        .error { margin-bottom: 14px; padding: 10px; border: 1px solid #fecaca; background: #fef2f2; color: #991b1b; border-radius: 8px; }
-        .info { margin-bottom: 14px; padding: 10px; border: 1px solid #bfdbfe; background: #eff6ff; color: #1e3a8a; border-radius: 8px; }
-        @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
-    </style>
-</head>
-<body>
-    <div class="navbar">
-        <div class="nav-links">
-            <a class="btn" href="/shelter/login">Shelter Login</a>
-        </div>
-        <span class="pill">Authenticated: no</span>
-    </div>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PawMap Shelter Portal</title>
 
-    <h1>Shelter Login</h1>
-    <p>This page is for Supabase auth. After login, you go to a shelter-specific dashboard.</p>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: linear-gradient(135deg, #f0fdf4, #eff6ff);
+      color: #111827;
+      min-height: 100vh;
+    }
+
+    .page {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 24px 16px 40px;
+    }
+
+    .navbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 32px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 20px;
+      color: #14532d;
+    }
+
+    .logo {
+      width: 42px;
+      height: 42px;
+      border-radius: 12px;
+      background: #16a34a;
+      color: white;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 22px;
+    }
+
+    .pill {
+      background: #ffffff;
+      color: #374151;
+      border: 1px solid #d1d5db;
+      border-radius: 999px;
+      padding: 7px 12px;
+      font-size: 13px;
+    }
+
+    .hero {
+      text-align: center;
+      margin-bottom: 28px;
+    }
+
+    .hero h1 {
+      font-size: 34px;
+      margin: 0 0 10px;
+      color: #064e3b;
+    }
+
+    .hero p {
+      margin: 0 auto;
+      max-width: 620px;
+      color: #4b5563;
+      line-height: 1.6;
+    }
+
+    .alert {
+      max-width: 720px;
+      margin: 0 auto 18px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      font-size: 14px;
+    }
+
+    .error {
+      background: #fef2f2;
+      color: #991b1b;
+      border: 1px solid #fecaca;
+    }
+
+    .info {
+      background: #eff6ff;
+      color: #1e3a8a;
+      border: 1px solid #bfdbfe;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 22px;
+      align-items: start;
+    }
+
+    .card {
+      background: rgba(255, 255, 255, 0.92);
+      border: 1px solid #e5e7eb;
+      border-radius: 18px;
+      padding: 24px;
+      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+    }
+
+    .card h2 {
+      margin: 0 0 6px;
+      font-size: 24px;
+      color: #111827;
+    }
+
+    .card .subtitle {
+      margin: 0 0 20px;
+      color: #6b7280;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+      margin: 14px 0 6px;
+      color: #374151;
+    }
+
+    input {
+      width: 100%;
+      padding: 12px 13px;
+      border: 1px solid #d1d5db;
+      border-radius: 10px;
+      font-size: 15px;
+      background: #ffffff;
+      outline: none;
+      transition: 0.2s;
+    }
+
+    input:focus {
+      border-color: #16a34a;
+      box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.16);
+    }
+
+    button {
+      width: 100%;
+      margin-top: 20px;
+      padding: 13px;
+      border: none;
+      border-radius: 12px;
+      background: #16a34a;
+      color: white;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: 0.2s;
+    }
+
+    button:hover {
+      background: #15803d;
+      transform: translateY(-1px);
+    }
+
+    .secondary-button {
+      background: #111827;
+    }
+
+    .secondary-button:hover {
+      background: #030712;
+    }
+
+    .note {
+      margin-top: 14px;
+      font-size: 13px;
+      color: #6b7280;
+      line-height: 1.5;
+      text-align: center;
+    }
+
+    .footer-note {
+      text-align: center;
+      margin-top: 28px;
+      color: #6b7280;
+      font-size: 13px;
+    }
+
+    @media (max-width: 760px) {
+      .navbar {
+        align-items: flex-start;
+        gap: 12px;
+      }
+
+      .hero h1 {
+        font-size: 28px;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      .card {
+        padding: 20px;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <main class="page">
+
+    <nav class="navbar">
+      <div class="brand">
+        <div class="logo">🐾</div>
+        <span>PawMap Shelter Portal</span>
+      </div>
+
+      <span class="pill">Authenticated: no</span>
+    </nav>
+
+    <section class="hero">
+      <h1>Shelter Login</h1>
+      <p>
+        Access your shelter dashboard to manage rescue cases, monitor reports,
+        and coordinate animal rescue operations through PawMap.
+      </p>
+    </section>
 
     {% if error %}
-    <div class="error">{{ error }}</div>
+      <div class="alert error">{{ error }}</div>
     {% endif %}
+
     {% if info %}
-    <div class="info">{{ info }}</div>
+      <div class="alert info">{{ info }}</div>
     {% endif %}
 
-    <div class="grid">
-        <div class="card">
-            <h2>Sign In</h2>
-            <form method="post" action="/shelter/sign-in">
-                <label>Email</label>
-                <input name="email" type="email" required />
-                <label>Password</label>
-                <input name="password" type="password" required />
-                <button type="submit">Sign In</button>
-            </form>
-        </div>
+    <section class="grid">
 
-        <div class="card">
-            <h2>Sign Up</h2>
-            <form method="post" action="/shelter/sign-up">
-                <label>First name</label>
-                <input name="first_name" type="text" />
-                <label>Last name</label>
-                <input name="last_name" type="text" />
-                <label>Email</label>
-                <input name="email" type="email" required />
-                <label>Password</label>
-                <input name="password" type="password" required />
-                <button type="submit">Create Account</button>
-            </form>
-        </div>
-    </div>
+      <div class="card">
+        <h2>Welcome Back</h2>
+        <p class="subtitle">
+          Sign in using your registered shelter account.
+        </p>
+
+        <form method="post" action="/shelter/sign-in">
+          <label>Email Address</label>
+          <input name="email" type="email" placeholder="Enter your email" required />
+
+          <label>Password</label>
+          <input name="password" type="password" placeholder="Enter your password" required />
+
+          <button class="secondary-button" type="submit">Sign In</button>
+        </form>
+
+        <p class="note">
+          Use the account approved for your shelter dashboard.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>Create Shelter Account</h2>
+        <p class="subtitle">
+          Register an account for shelter access. Approval may be required.
+        </p>
+
+        <form method="post" action="/shelter/sign-up">
+          <label>First Name</label>
+          <input name="first_name" type="text" placeholder="Enter first name" />
+
+          <label>Last Name</label>
+          <input name="last_name" type="text" placeholder="Enter last name" />
+
+          <label>Email Address</label>
+          <input name="email" type="email" placeholder="Enter your email" required />
+
+          <label>Password</label>
+          <input name="password" type="password" placeholder="Create a password" required />
+
+          <button type="submit">Create Account</button>
+        </form>
+
+        <p class="note">
+          Your account will be used for shelter rescue coordination.
+        </p>
+      </div>
+
+    </section>
+
+    <p class="footer-note">
+      PawMap Animal Rescue Management System
+    </p>
+
+  </main>
 </body>
 </html>

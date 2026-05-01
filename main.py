@@ -12,7 +12,8 @@ from typing import Any, Optional
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 from dotenv import load_dotenv
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret-change-me")
 
@@ -26,20 +27,25 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 supabase_client: Optional[Client] = None  # type: ignore[valid-type]
-if create_client and SUPABASE_URL and SUPABASE_KEY:
-    try:
-        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    except Exception:
-        supabase_client = None
+if create_client and SUPABASE_URL:
+    for candidate_key in (SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY):
+        if not candidate_key:
+            continue
+        try:
+            supabase_client = create_client(SUPABASE_URL, candidate_key)
+            break
+        except Exception:
+            supabase_client = None
 
 supabase_admin_client: Optional[Client] = None  # type: ignore[valid-type]
 if create_client and SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
     try:
-        supabase_admin_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+        supabase_admin_client = create_client(
+            SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     except Exception:
         supabase_admin_client = None
 
-DB_PATH = Path(__file__).resolve().with_name("basestation.db")
+DB_PATH = BASE_DIR / "basestation.db"
 NOTIFY_COOLDOWN_S = 60
 BATTERY_LOW_THRESHOLD = 10
 
@@ -60,6 +66,14 @@ server_config: dict[str, Any] = {
     "post_interval_min": 1,  # 1 | 5 | 15 | 30
     "gps_check_every_n_posts": 1,  # 1 | 2 | 5
 }
+
+
+def _supabase_unavailable_message() -> str:
+    if not create_client:
+        return "Supabase support is unavailable because the Python 'supabase' package is not installed."
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return "Supabase is not configured. Set SUPABASE_URL and SUPABASE_KEY in PawMap_BaseStation/.env."
+    return "Supabase client could not be initialized. Verify the credentials and installed dependencies."
 
 
 def _default_name(device_id: str) -> str:
@@ -196,7 +210,8 @@ def _init_db() -> None:
         except sqlite3.OperationalError:
             pass
         try:
-            conn.execute("ALTER TABLE pairing_claims ADD COLUMN claim_token TEXT")
+            conn.execute(
+                "ALTER TABLE pairing_claims ADD COLUMN claim_token TEXT")
         except sqlite3.OperationalError:
             pass
         try:
@@ -209,11 +224,13 @@ def _init_db() -> None:
         except sqlite3.OperationalError:
             pass
         try:
-            conn.execute("ALTER TABLE devices ADD COLUMN force_oob INTEGER NOT NULL DEFAULT 0")
+            conn.execute(
+                "ALTER TABLE devices ADD COLUMN force_oob INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
         try:
-            conn.execute("ALTER TABLE devices ADD COLUMN force_low_battery INTEGER NOT NULL DEFAULT 0")
+            conn.execute(
+                "ALTER TABLE devices ADD COLUMN force_low_battery INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
         try:
@@ -229,15 +246,18 @@ def _init_db() -> None:
         except sqlite3.OperationalError:
             pass
         try:
-            conn.execute("ALTER TABLE devices ADD COLUMN last_notify_ts REAL NOT NULL DEFAULT 0")
+            conn.execute(
+                "ALTER TABLE devices ADD COLUMN last_notify_ts REAL NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
         try:
-            conn.execute("ALTER TABLE devices ADD COLUMN last_batt_low INTEGER")
+            conn.execute(
+                "ALTER TABLE devices ADD COLUMN last_batt_low INTEGER")
         except sqlite3.OperationalError:
             pass
         try:
-            conn.execute("ALTER TABLE devices ADD COLUMN last_batt_notify_ts REAL NOT NULL DEFAULT 0")
+            conn.execute(
+                "ALTER TABLE devices ADD COLUMN last_batt_notify_ts REAL NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
 
@@ -245,7 +265,8 @@ def _init_db() -> None:
 def _load_server_config() -> None:
     global server_config
     with _db() as conn:
-        row = conn.execute("SELECT v FROM kv WHERE k = ?", ("server_config",)).fetchone()
+        row = conn.execute("SELECT v FROM kv WHERE k = ?",
+                           ("server_config",)).fetchone()
         if not row:
             return
         try:
@@ -268,6 +289,7 @@ def _save_server_config() -> None:
 _init_db()
 _load_server_config()
 
+
 def _compute_geofence(data: dict[str, Any], cfg: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     active_cfg = cfg or server_config
     gps = data.get("gps") if isinstance(data.get("gps"), dict) else None
@@ -282,7 +304,8 @@ def _compute_geofence(data: dict[str, Any], cfg: Optional[dict[str, Any]] = None
 
     mode = str(active_cfg.get("gps_mode") or "radius").lower()
     if mode == "bbox":
-        bbox = active_cfg.get("gps_bbox") if isinstance(active_cfg.get("gps_bbox"), dict) else None
+        bbox = active_cfg.get("gps_bbox") if isinstance(
+            active_cfg.get("gps_bbox"), dict) else None
         if not bbox:
             return {"out_of_bounds": None, "in_bounds": None, "reason": "no_bbox"}
         try:
@@ -300,7 +323,8 @@ def _compute_geofence(data: dict[str, Any], cfg: Optional[dict[str, Any]] = None
         }
 
     # radius mode (approx)
-    center = active_cfg.get("gps_center") if isinstance(active_cfg.get("gps_center"), dict) else None
+    center = active_cfg.get("gps_center") if isinstance(
+        active_cfg.get("gps_center"), dict) else None
     radius_m = active_cfg.get("gps_radius_m")
     if not center:
         return {"out_of_bounds": None, "in_bounds": None, "reason": "no_center"}
@@ -360,12 +384,14 @@ def _fcm_access_token() -> str | None:
         return None
 
     scopes = ["https://www.googleapis.com/auth/firebase.messaging"]
-    creds = service_account.Credentials.from_service_account_file(sa_file, scopes=scopes)
+    creds = service_account.Credentials.from_service_account_file(
+        sa_file, scopes=scopes)
     creds.refresh(GoogleAuthRequest())
     _fcm_token_cache["token"] = creds.token
     # creds.expiry is a datetime
     try:
-        _fcm_token_cache["exp"] = float(creds.expiry.timestamp())  # type: ignore[union-attr]
+        _fcm_token_cache["exp"] = float(
+            creds.expiry.timestamp())  # type: ignore[union-attr]
     except Exception:
         _fcm_token_cache["exp"] = now + 3000
     return str(creds.token)
@@ -412,7 +438,8 @@ def _send_fcm(token: str, title: str, body: str, data: dict[str, Any]) -> tuple[
     try:
         resp = requests.post(
             url,
-            headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {access}",
+                     "Content-Type": "application/json"},
             json=payload,
             timeout=6,
         )
@@ -461,7 +488,8 @@ def _record_and_send_notification(
             INSERT INTO notifications(device_id, ts, kind, title, body, ok, response)
             VALUES(?, ?, ?, ?, ?, ?, ?)
             """,
-            (device_id, now, kind, title, body, 1 if any_ok else 0, "\n---\n".join(responses)[:2000]),
+            (device_id, now, kind, title, body,
+             1 if any_ok else 0, "\n---\n".join(responses)[:2000]),
         )
 
 
@@ -483,7 +511,8 @@ def _resolve_pending_claim_user_id(incoming_name: str, now_ts: float) -> Optiona
         ).fetchone()
         if not row:
             return None
-        conn.execute("UPDATE pairing_claims SET claimed_at = ? WHERE id = ?", (now_ts, row["id"]))
+        conn.execute(
+            "UPDATE pairing_claims SET claimed_at = ? WHERE id = ?", (now_ts, row["id"]))
         return str(row["user_id"])
 
 
@@ -505,7 +534,8 @@ def _resolve_pending_claim_user_id_by_token(claim_token: str, now_ts: float) -> 
         ).fetchone()
         if not row:
             return None
-        conn.execute("UPDATE pairing_claims SET claimed_at = ? WHERE id = ?", (now_ts, row["id"]))
+        conn.execute(
+            "UPDATE pairing_claims SET claimed_at = ? WHERE id = ?", (now_ts, row["id"]))
         return str(row["user_id"])
 
 
@@ -523,7 +553,8 @@ def _supabase_target_user_ids_for_alerts(device_id: Optional[str] = None) -> lis
                 "SELECT shelter_user_id FROM devices WHERE device_id = ?",
                 (device_id,),
             ).fetchone()
-            owner_id = str(drow["shelter_user_id"]).strip() if (drow and drow["shelter_user_id"]) else ""
+            owner_id = str(drow["shelter_user_id"]).strip() if (
+                drow and drow["shelter_user_id"]) else ""
             if owner_id:
                 return [owner_id]
         return []
@@ -590,7 +621,8 @@ def _fcm_runtime_status() -> dict[str, Any]:
     project_id = _fcm_project_id()
     supabase_bridge = bool(supabase_admin_client or supabase_client)
     with _db() as conn:
-        token_row = conn.execute("SELECT COUNT(*) AS c FROM fcm_tokens").fetchone()
+        token_row = conn.execute(
+            "SELECT COUNT(*) AS c FROM fcm_tokens").fetchone()
         global_row = conn.execute(
             "SELECT COUNT(*) AS c FROM fcm_tokens WHERE device_id IS NULL"
         ).fetchone()
@@ -641,11 +673,13 @@ def _retry_failed_notifications(limit: int = 50) -> dict[str, int]:
                 skipped_no_tokens += 1
                 continue
 
-            data = {"device_id": device_id, "event": str(row["kind"] or "critical")}
+            data = {"device_id": device_id,
+                    "event": str(row["kind"] or "critical")}
             responses: list[str] = []
             any_ok = False
             for token in tokens:
-                ok, resp = _send_fcm(token, str(row["title"]), str(row["body"]), data)
+                ok, resp = _send_fcm(token, str(
+                    row["title"]), str(row["body"]), data)
                 any_ok = any_ok or ok
                 responses.append(resp)
                 if ok:
@@ -664,7 +698,8 @@ def _retry_failed_notifications(limit: int = 50) -> dict[str, int]:
             else:
                 conn.execute(
                     "UPDATE notifications SET response = ? WHERE id = ?",
-                    ("\n---\n".join(responses)[:2000] or str(row["response"] or "retry_failed")),
+                    ("\n---\n".join(responses)
+                     [:2000] or str(row["response"] or "retry_failed")),
                     row["id"],
                 )
 
@@ -707,30 +742,25 @@ def _device_view(
     geofence_config: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     active_cfg = geofence_config or server_config
-    post_interval_min = _coerce_int(active_cfg.get("post_interval_min"), 1)
-    if post_interval_min not in (1, 5, 15, 30):
-        post_interval_min = 1
-    # Keep a wider grace window so dashboard doesn't flap offline for long intervals.
-    # Requested behavior:
-    # - 1 min send interval -> offline after 5 minutes
-    # - 5 min send interval -> offline after 10 minutes
-    # For higher intervals, use interval + 5 minutes.
-    if post_interval_min == 1:
-        offline_timeout_s = 5 * 60
-    else:
-        offline_timeout_s = (post_interval_min + 5) * 60
+
+    offline_timeout_s = 90
 
     last_seen = float(entry.get("last_seen", 0.0))
     data = entry.get("data") or {}
     name = entry.get("name") or data.get("name") or _default_name(device_id)
+
     force_oob = bool(entry.get("force_oob") or False)
     force_low_battery = bool(entry.get("force_low_battery") or False)
     freeze_lat = entry.get("freeze_lat")
     freeze_lng = entry.get("freeze_lng")
-    age_s = max(0.0, time.time() - last_seen) if last_seen else None
-    status = "offline"
+
+    age_s = max(0.0, time.time() - last_seen) if last_seen else Nones
+
     if last_seen and age_s is not None and age_s <= offline_timeout_s:
         status = "online"
+    else:
+        status = "offline"
+
     return {
         "device_id": device_id,
         "name": name,
@@ -741,7 +771,9 @@ def _device_view(
         "geofence": _compute_geofence(data, geofence_config),
         "force_oob": force_oob,
         "force_low_battery": force_low_battery,
-        "location_frozen": bool(force_low_battery and freeze_lat is not None and freeze_lng is not None),
+        "location_frozen": bool(
+            force_low_battery and freeze_lat is not None and freeze_lng is not None
+        ),
     }
 
 
@@ -787,7 +819,8 @@ def _profile_for_user(user_id: str) -> Optional[dict[str, Any]]:
     if not supabase_client:
         return None
     try:
-        result = supabase_client.table("profiles").select("*").eq("user_id", user_id).maybe_single().execute()
+        result = supabase_client.table("profiles").select(
+            "*").eq("user_id", user_id).maybe_single().execute()
         return result.data
     except Exception:
         return None
@@ -934,7 +967,7 @@ def shelter_login() -> Any:
     if not supabase_client:
         return render_template(
             "auth_portal.html",
-            error="Supabase is not configured. Set SUPABASE_URL and SUPABASE_KEY in .env.",
+            error=_supabase_unavailable_message(),
             info=None,
         )
     user, _ = _session_user()
@@ -948,7 +981,7 @@ def shelter_sign_in() -> Any:
     if not supabase_client:
         return render_template(
             "auth_portal.html",
-            error="Supabase is not configured. Set SUPABASE_URL and SUPABASE_KEY in .env.",
+            error=_supabase_unavailable_message(),
             info=None,
         ), 500
     email = (request.form.get("email") or "").strip()
@@ -956,7 +989,8 @@ def shelter_sign_in() -> Any:
     if not email or not password:
         return render_template("auth_portal.html", error="Email and password are required.", info=None), 400
     try:
-        auth_response = supabase_client.auth.sign_in_with_password({"email": email, "password": password})
+        auth_response = supabase_client.auth.sign_in_with_password(
+            {"email": email, "password": password})
         user = getattr(auth_response, "user", None)
         auth_session = getattr(auth_response, "session", None)
         if not user or not auth_session:
@@ -965,8 +999,10 @@ def shelter_sign_in() -> Any:
                 error="Sign-in did not return a session. Check email verification settings.",
                 info=None,
             ), 401
-        session["sb_access_token"] = getattr(auth_session, "access_token", None)
-        session["sb_refresh_token"] = getattr(auth_session, "refresh_token", None)
+        session["sb_access_token"] = getattr(
+            auth_session, "access_token", None)
+        session["sb_refresh_token"] = getattr(
+            auth_session, "refresh_token", None)
         session["sb_user_id"] = getattr(user, "id", None)
         return redirect(url_for("shelter_dashboard"))
     except Exception as e:
@@ -978,7 +1014,7 @@ def shelter_sign_up() -> Any:
     if not supabase_client:
         return render_template(
             "auth_portal.html",
-            error="Supabase is not configured. Set SUPABASE_URL and SUPABASE_KEY in .env.",
+            error=_supabase_unavailable_message(),
             info=None,
         ), 500
     email = (request.form.get("email") or "").strip()
@@ -1161,7 +1197,8 @@ def set_config():
         "lng": _coerce_float(gps_center.get("lng"), server_config["gps_center"]["lng"]),
     }
     server_config["gps_radius_m"] = max(
-        1.0, _coerce_float(cfg.get("gps_radius_m"), server_config["gps_radius_m"])
+        1.0, _coerce_float(cfg.get("gps_radius_m"),
+                           server_config["gps_radius_m"])
     )
 
     # Optional bbox config (ignored when shelter boundary controls the bbox).
@@ -1188,7 +1225,8 @@ def set_config():
             # Allow explicit clearing: gps_bbox=null
             server_config["gps_bbox"] = None
 
-    gps_mode = str(cfg.get("gps_mode") or server_config.get("gps_mode") or "radius").lower()
+    gps_mode = str(cfg.get("gps_mode") or server_config.get(
+        "gps_mode") or "radius").lower()
     if bbox_locked:
         gps_mode = "bbox"
     if gps_mode not in ("radius", "bbox"):
@@ -1196,11 +1234,14 @@ def set_config():
     server_config["gps_mode"] = gps_mode
 
     server_config["battery_drain"] = max(
-        0, _coerce_int(cfg.get("battery_drain"), server_config["battery_drain"])
+        0, _coerce_int(cfg.get("battery_drain"),
+                       server_config["battery_drain"])
     )
-    server_config["battery_loop"] = bool(cfg.get("battery_loop", server_config["battery_loop"]))
+    server_config["battery_loop"] = bool(
+        cfg.get("battery_loop", server_config["battery_loop"]))
 
-    post_interval_min = _coerce_int(cfg.get("post_interval_min"), int(server_config.get("post_interval_min", 1)))
+    post_interval_min = _coerce_int(cfg.get("post_interval_min"), int(
+        server_config.get("post_interval_min", 1)))
     if post_interval_min not in (1, 5, 15, 30):
         post_interval_min = 1
     server_config["post_interval_min"] = post_interval_min
@@ -1239,7 +1280,8 @@ def pairing_start():
     claim_token = secrets.token_hex(8)
     with _db() as conn:
         # Best-effort cleanup.
-        conn.execute("DELETE FROM pairing_claims WHERE expires_at < ? OR claimed_at IS NOT NULL", (now,))
+        conn.execute(
+            "DELETE FROM pairing_claims WHERE expires_at < ? OR claimed_at IS NOT NULL", (now,))
         conn.execute(
             """
             INSERT INTO pairing_claims(user_id, expected_name, claim_token, created_at, expires_at)
@@ -1292,20 +1334,27 @@ def receive_data():
             (device_id,),
         ).fetchone()
         stored_name = str(row["name"]).strip() if row else ""
-        shelter_user_id = str(row["shelter_user_id"]).strip() if (row and row["shelter_user_id"]) else None
+        shelter_user_id = str(row["shelter_user_id"]).strip() if (
+            row and row["shelter_user_id"]) else None
         force_oob = int(row["force_oob"] or 0) if row else 0
         force_low_battery = int(row["force_low_battery"] or 0) if row else 0
-        freeze_lat = float(row["freeze_lat"]) if (row and row["freeze_lat"] is not None) else None
-        freeze_lng = float(row["freeze_lng"]) if (row and row["freeze_lng"] is not None) else None
-        prev_oob = int(row["last_oob"]) if (row and row["last_oob"] is not None) else None
+        freeze_lat = float(row["freeze_lat"]) if (
+            row and row["freeze_lat"] is not None) else None
+        freeze_lng = float(row["freeze_lng"]) if (
+            row and row["freeze_lng"] is not None) else None
+        prev_oob = int(row["last_oob"]) if (
+            row and row["last_oob"] is not None) else None
         last_notify_ts = float(row["last_notify_ts"] or 0.0) if row else 0.0
-        prev_batt_low = int(row["last_batt_low"]) if (row and row["last_batt_low"] is not None) else None
-        last_batt_notify_ts = float(row["last_batt_notify_ts"] or 0.0) if row else 0.0
+        prev_batt_low = int(row["last_batt_low"]) if (
+            row and row["last_batt_low"] is not None) else None
+        last_batt_notify_ts = float(
+            row["last_batt_notify_ts"] or 0.0) if row else 0.0
         name = incoming_name or stored_name or _default_name(device_id)
         force_oob_bool = bool(force_oob)
 
         if not shelter_user_id and incoming_claim_token:
-            shelter_user_id = _resolve_pending_claim_user_id_by_token(incoming_claim_token, now)
+            shelter_user_id = _resolve_pending_claim_user_id_by_token(
+                incoming_claim_token, now)
         if not shelter_user_id:
             shelter_user_id = _resolve_pending_claim_user_id(name, now)
 
@@ -1321,7 +1370,8 @@ def receive_data():
                 INSERT INTO devices(device_id, name, shelter_user_id, first_seen, last_seen, force_oob, force_low_battery, freeze_lat, freeze_lng)
                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (device_id, name, shelter_user_id, now, now, force_oob, force_low_battery, None, None),
+                (device_id, name, shelter_user_id, now, now,
+                 force_oob, force_low_battery, None, None),
             )
 
         if shelter_user_id:
@@ -1406,11 +1456,13 @@ def receive_data():
         # Decide whether to notify (priority: OOB, else low battery).
         if out is True and prev_oob != 1 and (now - (last_notify_ts or 0.0) >= NOTIFY_COOLDOWN_S):
             should_notify = True
-            reason = "forced" if force_oob_bool else str(geofence.get("reason") or "geofence")
+            reason = "forced" if force_oob_bool else str(
+                geofence.get("reason") or "geofence")
             notify_kind = "oob"
             notify_title = "Dog out of bounds"
             notify_body = f"{name} left the safe area ({reason})."
-            notify_data = {"device_id": device_id, "name": name, "event": "oob", "reason": reason}
+            notify_data = {"device_id": device_id,
+                           "name": name, "event": "oob", "reason": reason}
             rows = conn.execute(
                 """
                 SELECT token FROM fcm_tokens
@@ -1572,7 +1624,8 @@ def claim_device(device_id: str):
         ).fetchone()
         if not row:
             return jsonify({"status": "error", "error": "not_found"}), 404
-        owner_id = str(row["shelter_user_id"]).strip() if row["shelter_user_id"] else ""
+        owner_id = str(row["shelter_user_id"]).strip(
+        ) if row["shelter_user_id"] else ""
         if owner_id and owner_id != user_id:
             return jsonify({"status": "error", "error": "owned_by_other_shelter"}), 409
         conn.execute(
@@ -1670,12 +1723,14 @@ def notifications_test_push():
         payload = {}
 
     title = str(payload.get("title") or "Test alert")
-    body = str(payload.get("body") or "This is a test push notification from Base Station.")
+    body = str(payload.get("body")
+               or "This is a test push notification from Base Station.")
     device_id = str(payload.get("device_id") or "").strip() or None
     include_global = bool(payload.get("include_global", True))
     use_supabase = bool(payload.get("use_supabase", True))
 
-    tokens = _push_tokens_for_test(device_id=device_id, include_global=include_global)
+    tokens = _push_tokens_for_test(
+        device_id=device_id, include_global=include_global)
 
     now = time.time()
     sent = 0
@@ -1688,7 +1743,8 @@ def notifications_test_push():
             token,
             title,
             body,
-            {"event": "test", "device_id": device_id or "", "sent_at": str(int(now))},
+            {"event": "test", "device_id": device_id or "",
+                "sent_at": str(int(now))},
         )
         if ok:
             ok_count += 1
@@ -1702,14 +1758,16 @@ def notifications_test_push():
         if len(sample_responses) < 5:
             sample_responses.append(resp)
 
-    supabase_result: dict[str, Any] = {"enabled": False, "sent": 0, "failed": 0, "reason": "disabled"}
+    supabase_result: dict[str, Any] = {
+        "enabled": False, "sent": 0, "failed": 0, "reason": "disabled"}
     if use_supabase:
         supabase_result = _send_supabase_notification(
             category="tracker_test",
             title=title,
             message=body,
             route_path="/(shelter)/notifications",
-            payload={"event": "test", "device_id": device_id or "", "sent_at": str(int(now))},
+            payload={"event": "test", "device_id": device_id or "",
+                     "sent_at": str(int(now))},
         )
 
     if sent == 0 and int(supabase_result.get("sent", 0)) == 0:
