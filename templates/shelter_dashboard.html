@@ -4,83 +4,487 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{{ shelter_name | default("Shelter") }} Dashboard</title>
+
     <style>
-        body { font-family: Arial, sans-serif; max-width: 1100px; margin: 24px auto; padding: 0 16px; background: #f7f7fb; }
-        .navbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
-        .nav-links { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-        .top { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
-        .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 14px; margin-top: 12px; }
-        .warn { border: 1px solid #fde68a; background: #fffbeb; color: #92400e; padding: 10px; border-radius: 8px; margin-top: 10px; }
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        th, td { border-bottom: 1px solid #e5e7eb; text-align: left; padding: 10px; font-size: 14px; vertical-align: top; }
-        th { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: #6b7280; }
-        a.btn { text-decoration: none; border: 1px solid #d1d5db; border-radius: 8px; padding: 8px 10px; color: #111827; background: #fff; }
-        .pill { display:inline-block; border:1px solid #bfdbfe; background:#eff6ff; color:#1e3a8a; border-radius:999px; padding:4px 8px; font-size:12px; }
-        code { font-size: 12px; }
+        :root {
+            --bg: #eef4f8;
+            --panel: #ffffff;
+            --text: #102033;
+            --muted: #64748b;
+            --border: #dbe5ec;
+            --accent: #2563eb;
+            --accent-soft: #eaf2ff;
+            --shadow: 0 12px 35px rgba(15, 23, 42, 0.08);
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: linear-gradient(180deg, #f8fbff 0%, #eef4f8 100%);
+            color: var(--text);
+        }
+
+        .container {
+            max-width: 1180px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+
+        .navbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: rgba(255, 255, 255, 0.92);
+    backdrop-filter: blur(14px);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 16px;
+    box-shadow: 0 4px 20px rgba(15, 23, 42, 0.04);
+}
+.nav-inner {
+    max-width: 1180px;
+    margin: 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+.row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+        .nav-links {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            text-decoration: none;
+            border: 1px solid #cbd5e1;
+            border-radius: 999px;
+            padding: 8px 14px;
+            color: #111827;
+            background: #fff;
+            font-weight: 700;
+            font-size: 13px;
+        }
+
+        .btn:hover {
+            background: var(--accent-soft);
+            color: #1d4ed8;
+        }
+
+        .pill {
+            display: inline-block;
+            border: 1px solid #bfdbfe;
+            background: #dbeafe;
+            color: #1e40af;
+            border-radius: 999px;
+            padding: 5px 10px;
+            font-size: 12px;
+            font-weight: 700;
+        }
+
+        .top {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin-top: 20px;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 30px;
+            font-weight: 900;
+            letter-spacing: -0.04em;
+        }
+
+        .subtitle {
+            color: var(--muted);
+            font-size: 13px;
+            margin-top: 6px;
+        }
+
+        .card {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            padding: 18px;
+            margin-top: 14px;
+            box-shadow: var(--shadow);
+        }
+
+        .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 12px;
+    margin-top: 18px;
+}
+
+        .stat-card {
+            background: #fff;
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            padding: 16px;
+            box-shadow: var(--shadow);
+        }
+
+        .stat-title {
+            font-size: 12px;
+            color: var(--muted);
+            font-weight: 700;
+        }
+
+        .stat-value {
+            font-size: 26px;
+            font-weight: 900;
+            margin-top: 6px;
+        }
+
+        .warn {
+            border: 1px solid #fde68a;
+            background: #fffbeb;
+            color: #92400e;
+            padding: 12px;
+            border-radius: 14px;
+            margin-top: 12px;
+        }
+
+        .table-tools {
+            display: grid;
+            grid-template-columns: 1.5fr 1fr 1fr;
+            gap: 10px;
+            margin-top: 12px;
+        }
+
+        .search-input,
+        .filter-select {
+            width: 100%;
+            padding: 11px 12px;
+            border: 1px solid #cbd5e1;
+            border-radius: 12px;
+            font-size: 14px;
+            background: #fff;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 12px;
+        }
+
+        th, td {
+            border-bottom: 1px solid #e5e7eb;
+            text-align: left;
+            padding: 12px 10px;
+            font-size: 14px;
+            vertical-align: middle;
+        }
+
+        th {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: #64748b;
+            font-weight: 900;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        th:hover {
+            color: #2563eb;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 5px 9px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 800;
+        }
+
+        .badge.green {
+            background: #dcfce7;
+            color: #166534;
+        }
+
+        .badge.yellow {
+            background: #fef3c7;
+            color: #92400e;
+        }
+
+        .badge.blue {
+            background: #dbeafe;
+            color: #1e40af;
+        }
+
+        .no-results {
+            padding: 18px;
+            text-align: center;
+            color: var(--muted);
+            font-weight: 700;
+        }
+
+        code {
+            font-size: 12px;
+        }
+
+        @media (max-width: 800px) {
+            .stats-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+
+            .table-tools {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 520px) {
+            .container {
+                padding: 16px;
+            }
+
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+
+            table {
+                min-width: 760px;
+            }
+
+            .table-wrap {
+                overflow-x: auto;
+            }
+        }
     </style>
 </head>
+
 <body>
     <div class="navbar">
+    <div class="nav-inner">
         <div class="nav-links">
             <a class="btn" href="/dashboard">Tracker Dashboard</a>
-            <a class="btn" href="/shelter">Shelter</a>
         </div>
-        <div class="nav-links">
+
+        <div class="row">
             <span class="pill">Authenticated: {{ "yes" if user and user.id else "no" }}</span>
+            {% if user and user.email %}
+            <span class="subtitle">{{ user.email }}</span>
+            {% endif %}
             <a class="btn" href="/shelter/logout">Logout</a>
         </div>
     </div>
+</div>
 
-    <div class="top">
-        <h1>{{ shelter_name | default("Shelter") }} Dashboard</h1>
-        <div style="font-size:13px;color:#6b7280;">{{ user.email or "No email" }}</div>
+    <main class="container">
+        <div class="top">
+            <div>
+                <h1>{{ shelter_name | default("Shelter") }} Dashboard</h1>
+                <div class="subtitle">Powered by PawMap • Shelter animal management overview</div>
+            </div>
+            <div class="subtitle">{{ user.email or "No email" }}</div>
+        </div>
+
+        <div class="stats-grid">
+    <div class="stat-card">
+        <div class="stat-title">Total Animals</div>
+        <div class="stat-value">{{ animals|length }}</div>
     </div>
 
-    <div class="card">
-        <div><strong>User ID:</strong> <code>{{ user.id }}</code></div>
-        <div><strong>Email:</strong> {{ user.email }}</div>
-        <div><strong>Role:</strong> {{ role or "unknown" }}</div>
+    <div class="stat-card">
+        <div class="stat-title">Available</div>
+        <div class="stat-value">
+            {{ animals | selectattr("status", "equalto", "available") | list | length }}
+        </div>
     </div>
 
-    {% if not is_shelter %}
-    <div class="warn">
-        Your profile role is not <strong>shelter</strong>. You can still log in, but shelter-specific screens should use a shelter account.
+    <div class="stat-card">
+        <div class="stat-title">On Hold</div>
+        <div class="stat-value">
+            {{ animals | selectattr("status", "equalto", "on_hold") | list | length }}
+        </div>
     </div>
-    {% endif %}
 
-    {% if error %}
-    <div class="warn">{{ error }}</div>
-    {% endif %}
-
-    <div class="card">
-        <h2>Your Adoptable Animals</h2>
-        <p>This list is filtered by <code>adoptable_animals.shelter_id = your auth user id</code>.</p>
-        <table>
-            <thead>
-                <tr>
-                    <th>Name</th>
-                    <th>Species</th>
-                    <th>Status</th>
-                    <th>Listing Type</th>
-                    <th>Created</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for animal in animals %}
-                <tr>
-                    <td>{{ animal.name }}</td>
-                    <td>{{ animal.species }}</td>
-                    <td>{{ animal.status }}</td>
-                    <td>{{ animal.listing_type }}</td>
-                    <td>{{ animal.created_at }}</td>
-                </tr>
-                {% else %}
-                <tr>
-                    <td colspan="5">No rows found for this shelter yet.</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
+    <div class="stat-card">
+        <div class="stat-title">Dogs</div>
+        <div class="stat-value">
+            {{ animals | selectattr("species", "equalto", "dog") | list | length }}
+        </div>
     </div>
+
+    <div class="stat-card">
+        <div class="stat-title">Cats</div>
+        <div class="stat-value">
+            {{ animals | selectattr("species", "equalto", "cat") | list | length }}
+        </div>
+    </div>
+</div>
+
+        <div class="card">
+            <h3 style="margin-top:0;">Shelter Information</h3>
+            <div><strong>Email:</strong> {{ user.email }}</div>
+            <div><strong>Role:</strong> {{ role or "unknown" }}</div>
+        </div>
+
+        {% if not is_shelter %}
+        <div class="warn">
+            Your profile role is not <strong>shelter</strong>. You can still log in, but shelter-specific screens should use a shelter account.
+        </div>
+        {% endif %}
+
+        {% if error %}
+        <div class="warn">{{ error }}</div>
+        {% endif %}
+
+        <div class="card">
+            <h2 style="margin-top:0;">Your Adoptable Animals</h2>
+            <p class="subtitle">Animals currently registered under this shelter account.</p>
+
+            <div class="table-tools">
+                <input
+                    id="searchInput"
+                    class="search-input"
+                    placeholder="Search animal by name, species, status, or listing type..."
+                />
+
+                <select id="statusFilter" class="filter-select">
+                    <option value="">All Status</option>
+                    <option value="available">Available</option>
+                    <option value="on_hold">On Hold</option>
+                </select>
+
+                <select id="speciesFilter" class="filter-select">
+                    <option value="">All Species</option>
+                    <option value="dog">Dog</option>
+                    <option value="cat">Cat</option>
+                </select>
+            </div>
+
+            <div class="table-wrap">
+                <table id="animalTable">
+                    <thead>
+                        <tr>
+                            <th onclick="sortTable(0)">Name</th>
+                            <th onclick="sortTable(1)">Species</th>
+                            <th onclick="sortTable(2)">Status</th>
+                            <th onclick="sortTable(3)">Listing Type</th>
+                            <th onclick="sortTable(4)">Created</th>
+                        </tr>
+                    </thead>
+
+                    <tbody id="animalTbody">
+                        {% for animal in animals %}
+                        <tr
+                            data-name="{{ animal.name | lower }}"
+                            data-species="{{ animal.species | lower }}"
+                            data-status="{{ animal.status | lower }}"
+                            data-listing="{{ animal.listing_type | lower }}"
+                            data-created="{{ animal.created_at.split('T')[0] if animal.created_at else '-' }}"
+                        >
+                            <td><strong>{{ animal.name }}</strong></td>
+                            <td>{{ animal.species }}</td>
+                            <td>
+                                {% if animal.status == "available" %}
+                                    <span class="badge green">Available</span>
+                                {% elif animal.status == "on_hold" %}
+                                    <span class="badge yellow">On Hold</span>
+                                {% else %}
+                                    <span class="badge blue">{{ animal.status }}</span>
+                                {% endif %}
+                            </td>
+                            <td>{{ animal.listing_type }}</td>
+                            <td>{{ animal.created_at.split("T")[0] if animal.created_at else "-" }}</td>
+                        </tr>
+                        {% else %}
+                        <tr>
+                            <td colspan="5">No rows found for this shelter yet.</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+
+                <div id="noResults" class="no-results" style="display:none;">
+                    No animals match your search or filter.
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        const searchInput = document.getElementById("searchInput");
+        const statusFilter = document.getElementById("statusFilter");
+        const speciesFilter = document.getElementById("speciesFilter");
+        const table = document.getElementById("animalTable");
+        const tbody = document.getElementById("animalTbody");
+        const noResults = document.getElementById("noResults");
+
+        function filterTable() {
+            const searchValue = searchInput.value.trim().toLowerCase();
+            const statusValue = statusFilter.value.trim().toLowerCase();
+            const speciesValue = speciesFilter.value.trim().toLowerCase();
+
+            const rows = Array.from(tbody.querySelectorAll("tr"));
+            let visibleCount = 0;
+
+            rows.forEach(row => {
+                const name = row.dataset.name || "";
+                const species = row.dataset.species || "";
+                const status = row.dataset.status || "";
+                const listing = row.dataset.listing || "";
+                const created = row.dataset.created || "";
+
+                const combinedText = `${name} ${species} ${status} ${listing} ${created}`;
+
+                const matchesSearch = !searchValue || combinedText.includes(searchValue);
+                const matchesStatus = !statusValue || status === statusValue;
+                const matchesSpecies = !speciesValue || species === speciesValue;
+
+                const shouldShow = matchesSearch && matchesStatus && matchesSpecies;
+                row.style.display = shouldShow ? "" : "none";
+
+                if (shouldShow) visibleCount++;
+            });
+
+            noResults.style.display = visibleCount === 0 ? "block" : "none";
+        }
+
+        searchInput.addEventListener("input", filterTable);
+        statusFilter.addEventListener("change", filterTable);
+        speciesFilter.addEventListener("change", filterTable);
+
+        let sortDirection = {};
+
+        function sortTable(columnIndex) {
+            const rowsArray = Array.from(tbody.querySelectorAll("tr"));
+
+            const direction = sortDirection[columnIndex] === "asc" ? "desc" : "asc";
+            sortDirection[columnIndex] = direction;
+
+            rowsArray.sort((a, b) => {
+                let valA = a.cells[columnIndex]?.innerText.trim().toLowerCase() || "";
+                let valB = b.cells[columnIndex]?.innerText.trim().toLowerCase() || "";
+
+                if (columnIndex === 4) {
+                    valA = new Date(valA);
+                    valB = new Date(valB);
+                }
+
+                if (valA < valB) return direction === "asc" ? -1 : 1;
+                if (valA > valB) return direction === "asc" ? 1 : -1;
+                return 0;
+            });
+
+            rowsArray.forEach(row => tbody.appendChild(row));
+            filterTable();
+        }
+    </script>
 </body>
 </html>

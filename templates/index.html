@@ -640,22 +640,23 @@
 
 <body>
     <div class="navbar">
-        <div class="nav-inner">
-            <div class="nav-links">
-                <a href="/dashboard">Tracker Dashboard</a>
-                <a href="/shelter">Shelter</a>
-            </div>
-            <div class="row">
-                <span class="pill info">Authenticated: {{ "yes" if user and user.id else "no" }}</span>
-                {% if user and user.email %}
-                <span class="subtitle">{{ user.email }}</span>
-                {% endif %}
-                <a href="/shelter/logout" style="text-decoration:none;">
-                    <button>Logout</button>
-                </a>
-            </div>
+    <div class="nav-inner">
+        <div class="nav-links">
+            <a href="/shelter">Shelter Dashboard</a>
+        </div>
+
+        <div class="row">
+            <span class="pill info">Authenticated: {{ "yes" if user and user.id else "no" }}</span>
+            {% if user and user.email %}
+            <span class="subtitle">{{ user.email }}</span>
+            {% endif %}
+            <a href="/shelter/logout" style="text-decoration:none;">
+                <button>Logout</button>
+            </a>
         </div>
     </div>
+</div>
+
     <div class="container">
         <div class="topbar">
             <div class="title">
