@@ -754,7 +754,7 @@ def _device_view(
     freeze_lat = entry.get("freeze_lat")
     freeze_lng = entry.get("freeze_lng")
 
-    age_s = max(0.0, time.time() - last_seen) if last_seen else Nones
+    age_s = max(0.0, time.time() - last_seen) if last_seen else None
 
     if last_seen and age_s is not None and age_s <= offline_timeout_s:
         status = "online"
@@ -961,9 +961,24 @@ def require_web_session_api(fn):
 @app.get("/dashboard")
 @require_web_session_page
 def dashboard() -> str:
-    # Prefill base station IP from how the user accessed this page.
     server_ip = (request.host or "").split(":", 1)[0]
-    return render_template("index.html", server_ip=server_ip, user=_serialize_auth_user(getattr(request, "user", None)))
+    user = getattr(request, "user", None)
+    user_id = getattr(user, "id", None)
+
+    profile = _profile_for_user(user_id) if user_id else None
+    shelter_name = (
+        (profile or {}).get("shelter_name")
+        or (profile or {}).get("organization_name")
+        or (profile or {}).get("name")
+        or "Shelter"
+    )
+
+    return render_template(
+        "index.html",
+        server_ip=server_ip,
+        user=_serialize_auth_user(user),
+        shelter_name=shelter_name,
+    )
 
 
 @app.get("/shelter/login")
@@ -1067,6 +1082,12 @@ def shelter_dashboard() -> Any:
     profile = _profile_for_user(user_id)
     role = (profile or {}).get("role")
     is_shelter = role == "shelter"
+    shelter_name = (
+        (profile or {}).get("shelter_name")
+        or (profile or {}).get("organization_name")
+        or (profile or {}).get("name")
+        or "Shelter"
+    )
 
     animals = []
     error = None
@@ -1090,6 +1111,7 @@ def shelter_dashboard() -> Any:
         is_shelter=is_shelter,
         animals=animals,
         error=error,
+        shelter_name=shelter_name,
     )
 
 

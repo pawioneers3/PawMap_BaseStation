@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Shelter Dashboard</title>
+    <title>{{ shelter_name | default("Shelter") }} Dashboard</title>
     <style>
         body { font-family: Arial, sans-serif; max-width: 1100px; margin: 24px auto; padding: 0 16px; background: #f7f7fb; }
         .navbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
@@ -32,7 +32,7 @@
     </div>
 
     <div class="top">
-        <h1>Shelter Dashboard</h1>
+        <h1>{{ shelter_name | default("Shelter") }} Dashboard</h1>
         <div style="font-size:13px;color:#6b7280;">{{ user.email or "No email" }}</div>
     </div>
 
