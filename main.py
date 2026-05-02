@@ -4,6 +4,7 @@ import json
 import os
 import secrets
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
 from functools import wraps
@@ -54,6 +55,8 @@ if create_client and SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
 DB_PATH = BASE_DIR / "basestation.db"
 NOTIFY_COOLDOWN_S = 30
 BATTERY_LOW_THRESHOLD = 10
+OFFLINE_TIMEOUT_S = 90
+OFFLINE_MONITOR_INTERVAL_S = 15
 
 
 server_config: dict[str, Any] = {
@@ -127,7 +130,10 @@ def _init_db() -> None:
                 last_oob INTEGER,
                 last_notify_ts REAL NOT NULL DEFAULT 0,
                 last_batt_low INTEGER,
-                last_batt_notify_ts REAL NOT NULL DEFAULT 0
+                last_batt_notify_ts REAL NOT NULL DEFAULT 0,
+                last_offline INTEGER NOT NULL DEFAULT 0,
+                last_offline_notify_ts REAL NOT NULL DEFAULT 0,
+                last_recovery_notify_ts REAL NOT NULL DEFAULT 0
             )
             """
         )
@@ -264,6 +270,21 @@ def _init_db() -> None:
         try:
             conn.execute(
                 "ALTER TABLE devices ADD COLUMN last_batt_notify_ts REAL NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                "ALTER TABLE devices ADD COLUMN last_offline INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                "ALTER TABLE devices ADD COLUMN last_offline_notify_ts REAL NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                "ALTER TABLE devices ADD COLUMN last_recovery_notify_ts REAL NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
 
@@ -598,6 +619,9 @@ def _reset_device_tracking_state(conn: sqlite3.Connection, device_id: str, now_t
             last_notify_ts = 0,
             last_batt_low = NULL,
             last_batt_notify_ts = 0,
+            last_offline = 0,
+            last_offline_notify_ts = 0,
+            last_recovery_notify_ts = 0,
             force_oob = 0,
             force_low_battery = 0,
             freeze_lat = NULL,
@@ -859,7 +883,8 @@ def _fcm_runtime_status() -> dict[str, Any]:
         "registered_tokens": int(token_row["c"] if token_row else 0),
         "global_tokens": int(global_row["c"] if global_row else 0),
         "failed_notifications": int(failed_row["c"] if failed_row else 0),
-        "critical_events": ["oob", "low_battery"],
+        "critical_events": ["oob", "low_battery", "offline"],
+        "recovery_events": ["online", "in_bounds"],
         "supabase_bridge_enabled": supabase_bridge,
     }
 
@@ -928,6 +953,124 @@ def _retry_failed_notifications(limit: int = 50) -> dict[str, int]:
     return {"retried": retried, "sent_ok": sent_ok, "skipped_no_tokens": skipped_no_tokens}
 
 
+def _scan_and_notify_offline_devices(now: Optional[float] = None) -> int:
+    now_ts = time.time() if now is None else now
+    offline_before = now_ts - OFFLINE_TIMEOUT_S
+    pending: list[dict[str, Any]] = []
+
+    with _db() as conn:
+        rows = conn.execute(
+            """
+            SELECT device_id, name, last_seen, last_offline, last_offline_notify_ts
+            FROM devices
+            WHERE last_seen > 0
+              AND last_seen <= ?
+              AND COALESCE(last_offline, 0) != 1
+              AND (? - COALESCE(last_offline_notify_ts, 0)) >= ?
+            """,
+            (offline_before, now_ts, NOTIFY_COOLDOWN_S),
+        ).fetchall()
+
+        for row in rows:
+            device_id = str(row["device_id"])
+            name = str(row["name"] or _default_name(device_id))
+            last_seen = float(row["last_seen"] or 0.0)
+            age_s = max(0, int(now_ts - last_seen)) if last_seen else None
+            title = "Tracker disconnected"
+            if age_s is not None:
+                body = (
+                    f"{name} has been offline for {age_s}s. "
+                    "Check battery, Wi-Fi, or location."
+                )
+            else:
+                body = f"{name} is offline. Check battery, Wi-Fi, or location."
+            data = {
+                "device_id": device_id,
+                "name": name,
+                "event": "offline",
+                "last_seen": int(last_seen),
+                "offline_for_s": age_s if age_s is not None else "",
+            }
+            token_rows = conn.execute(
+                """
+                SELECT token FROM fcm_tokens
+                WHERE device_id = ? OR device_id IS NULL
+                """,
+                (device_id,),
+            ).fetchall()
+            pending.append(
+                {
+                    "device_id": device_id,
+                    "title": title,
+                    "body": body,
+                    "data": data,
+                    "tokens": [str(r["token"]) for r in token_rows],
+                }
+            )
+            conn.execute(
+                """
+                UPDATE devices
+                SET last_offline = 1,
+                    last_offline_notify_ts = ?
+                WHERE device_id = ?
+                """,
+                (now_ts, device_id),
+            )
+
+    for item in pending:
+        _record_and_send_notification(
+            device_id=str(item["device_id"]),
+            kind="offline",
+            title=str(item["title"]),
+            body=str(item["body"]),
+            now=now_ts,
+            tokens=item["tokens"],
+            data=item["data"],
+        )
+        _send_supabase_notification(
+            device_id=str(item["device_id"]),
+            category="tracker_offline",
+            title=str(item["title"]),
+            message=str(item["body"]),
+            route_path="/(shelter)/notifications",
+            payload=item["data"],
+        )
+
+    return len(pending)
+
+
+_offline_monitor_started = False
+_offline_monitor_lock = threading.Lock()
+
+
+def _offline_alert_monitor_loop() -> None:
+    while True:
+        try:
+            _scan_and_notify_offline_devices()
+        except Exception:
+            pass
+        time.sleep(OFFLINE_MONITOR_INTERVAL_S)
+
+
+def _start_offline_alert_monitor() -> None:
+    global _offline_monitor_started
+    with _offline_monitor_lock:
+        if _offline_monitor_started:
+            return
+        _offline_monitor_started = True
+        thread = threading.Thread(
+            target=_offline_alert_monitor_loop,
+            name="offline-alert-monitor",
+            daemon=True,
+        )
+        thread.start()
+
+
+@app.before_request
+def _ensure_offline_alert_monitor_running() -> None:
+    _start_offline_alert_monitor()
+
+
 def _push_tokens_for_test(device_id: Optional[str] = None, include_global: bool = True) -> list[str]:
     with _db() as conn:
         if device_id:
@@ -965,8 +1108,6 @@ def _device_view(
 ) -> dict[str, Any]:
     active_cfg = geofence_config or server_config
 
-    offline_timeout_s = 90
-
     last_seen = float(entry.get("last_seen", 0.0))
     data = entry.get("data") or {}
     name = entry.get("name") or data.get("name") or _default_name(device_id)
@@ -978,7 +1119,7 @@ def _device_view(
 
     age_s = max(0.0, time.time() - last_seen) if last_seen else None
 
-    if last_seen and age_s is not None and age_s <= offline_timeout_s:
+    if last_seen and age_s is not None and age_s <= OFFLINE_TIMEOUT_S:
         status = "online"
     else:
         status = "offline"
@@ -1562,12 +1703,7 @@ def receive_data():
     incoming_claim_token = str(data.get("claim_token") or "").strip()
 
     now = time.time()
-    notify_tokens: list[str] = []
-    notify_kind = ""
-    notify_title = ""
-    notify_body = ""
-    notify_data: dict[str, Any] = {}
-    should_notify = False
+    queued_notifications: list[dict[str, Any]] = []
     force_oob_bool = False
     fresh_pairing = False
     name = ""
@@ -1584,7 +1720,8 @@ def receive_data():
         row = conn.execute(
             """
             SELECT name, shelter_user_id, force_oob, force_low_battery, freeze_lat, freeze_lng,
-                   last_oob, last_notify_ts, last_batt_low, last_batt_notify_ts
+                   last_oob, last_notify_ts, last_batt_low, last_batt_notify_ts,
+                   last_offline, last_recovery_notify_ts
             FROM devices
             WHERE device_id = ?
             """,
@@ -1606,6 +1743,9 @@ def receive_data():
             row and row["last_batt_low"] is not None) else None
         last_batt_notify_ts = float(
             row["last_batt_notify_ts"] or 0.0) if row else 0.0
+        prev_offline = int(row["last_offline"] or 0) if row else 0
+        last_recovery_notify_ts = float(
+            row["last_recovery_notify_ts"] or 0.0) if row else 0.0
         name = incoming_name or stored_name or _default_name(device_id)
         force_oob_bool = bool(force_oob)
 
@@ -1626,7 +1766,14 @@ def receive_data():
         # Upsert device.
         if row:
             conn.execute(
-                "UPDATE devices SET name = ?, last_seen = ?, shelter_user_id = COALESCE(shelter_user_id, ?) WHERE device_id = ?",
+                """
+                UPDATE devices
+                SET name = ?,
+                    last_seen = ?,
+                    shelter_user_id = COALESCE(shelter_user_id, ?),
+                    last_offline = 0
+                WHERE device_id = ?
+                """,
                 (name, now, shelter_user_id, device_id),
             )
             if fresh_pairing:
@@ -1639,6 +1786,8 @@ def receive_data():
                 last_notify_ts = 0.0
                 prev_batt_low = None
                 last_batt_notify_ts = 0.0
+                prev_offline = 0
+                last_recovery_notify_ts = 0.0
                 force_oob_bool = False
         else:
             conn.execute(
@@ -1648,6 +1797,42 @@ def receive_data():
                 """,
                 (device_id, name, shelter_user_id, now, now,
                  force_oob, force_low_battery, None, None),
+            )
+
+        def push_tokens_for_device() -> list[str]:
+            rows = conn.execute(
+                """
+                SELECT token FROM fcm_tokens
+                WHERE device_id = ? OR device_id IS NULL
+                """,
+                (device_id,),
+            ).fetchall()
+            return [str(r["token"]) for r in rows]
+
+        if (
+            row
+            and not fresh_pairing
+            and prev_offline == 1
+            and (now - (last_recovery_notify_ts or 0.0) >= NOTIFY_COOLDOWN_S)
+        ):
+            notify_data = {
+                "device_id": device_id,
+                "name": name,
+                "event": "online",
+            }
+            queued_notifications.append(
+                {
+                    "kind": "online",
+                    "title": "Tracker back online",
+                    "body": f"{name} is connected again.",
+                    "data": notify_data,
+                    "tokens": push_tokens_for_device(),
+                }
+            )
+            last_recovery_notify_ts = now
+            conn.execute(
+                "UPDATE devices SET last_recovery_notify_ts = ? WHERE device_id = ?",
+                (now, device_id),
             )
 
         if shelter_user_id:
@@ -1754,25 +1939,46 @@ def receive_data():
 
         # Decide whether to notify (priority: OOB, else low battery).
         if out is True and prev_oob != 1 and (now - (last_notify_ts or 0.0) >= NOTIFY_COOLDOWN_S):
-            should_notify = True
             reason = "forced" if force_oob_bool else str(
                 geofence.get("reason") or "geofence")
-            notify_kind = "oob"
-            notify_title = "Dog out of bounds"
-            notify_body = f"{name} left the safe area ({reason})."
             notify_data = {"device_id": device_id,
                            "name": name, "event": "oob", "reason": reason}
-            rows = conn.execute(
-                """
-                SELECT token FROM fcm_tokens
-                WHERE device_id = ? OR device_id IS NULL
-                """,
-                (device_id,),
-            ).fetchall()
-            notify_tokens = [str(r["token"]) for r in rows]
+            queued_notifications.append(
+                {
+                    "kind": "oob",
+                    "title": "Dog out of bounds",
+                    "body": f"{name} left the safe area ({reason}).",
+                    "data": notify_data,
+                    "tokens": push_tokens_for_device(),
+                }
+            )
             # Reserve the cooldown immediately to avoid duplicates.
             conn.execute(
                 "UPDATE devices SET last_notify_ts = ? WHERE device_id = ?",
+                (now, device_id),
+            )
+        elif (
+            out is False
+            and prev_oob == 1
+            and (now - (last_recovery_notify_ts or 0.0) >= NOTIFY_COOLDOWN_S)
+        ):
+            notify_data = {
+                "device_id": device_id,
+                "name": name,
+                "event": "in_bounds",
+            }
+            queued_notifications.append(
+                {
+                    "kind": "in_bounds",
+                    "title": "Dog back in bounds",
+                    "body": f"{name} is back inside the safe area.",
+                    "data": notify_data,
+                    "tokens": push_tokens_for_device(),
+                }
+            )
+            last_recovery_notify_ts = now
+            conn.execute(
+                "UPDATE devices SET last_recovery_notify_ts = ? WHERE device_id = ?",
                 (now, device_id),
             )
         elif (
@@ -1780,10 +1986,6 @@ def receive_data():
             and prev_batt_low != 1
             and (now - (last_batt_notify_ts or 0.0) >= NOTIFY_COOLDOWN_S)
         ):
-            should_notify = True
-            notify_kind = "low_battery"
-            notify_title = "Low battery"
-            notify_body = f"{name} battery is low ({effective_battery_i}%)."
             notify_data = {
                 "device_id": device_id,
                 "name": name,
@@ -1791,14 +1993,15 @@ def receive_data():
                 "battery": effective_battery_i,
                 "forced": bool(force_low_battery),
             }
-            rows = conn.execute(
-                """
-                SELECT token FROM fcm_tokens
-                WHERE device_id = ? OR device_id IS NULL
-                """,
-                (device_id,),
-            ).fetchall()
-            notify_tokens = [str(r["token"]) for r in rows]
+            queued_notifications.append(
+                {
+                    "kind": "low_battery",
+                    "title": "Low battery",
+                    "body": f"{name} battery is low ({effective_battery_i}%).",
+                    "data": notify_data,
+                    "tokens": push_tokens_for_device(),
+                }
+            )
             conn.execute(
                 "UPDATE devices SET last_batt_notify_ts = ? WHERE device_id = ?",
                 (now, device_id),
@@ -1821,24 +2024,24 @@ def receive_data():
     response_config = _effective_server_config_for_user(shelter_user_id)
     response_config["force_oob"] = bool(force_oob)
 
-    if should_notify:
+    for notification in queued_notifications:
         _record_and_send_notification(
             device_id=device_id,
-            kind=notify_kind,
-            title=notify_title,
-            body=notify_body,
+            kind=str(notification["kind"]),
+            title=str(notification["title"]),
+            body=str(notification["body"]),
             now=now,
-            tokens=notify_tokens,
-            data=notify_data,
+            tokens=notification["tokens"],
+            data=notification["data"],
         )
         # Also bridge into Supabase notifications (Expo push pipeline) for mobile app delivery.
         _send_supabase_notification(
             device_id=device_id,
-            category=f"tracker_{notify_kind}",
-            title=notify_title,
-            message=notify_body,
+            category=f"tracker_{notification['kind']}",
+            title=str(notification["title"]),
+            message=str(notification["body"]),
             route_path="/(shelter)/notifications",
-            payload=notify_data,
+            payload=notification["data"],
         )
     return jsonify({"status": "ok", "config": response_config, "tracker_ingest": heartbeat_result})
 

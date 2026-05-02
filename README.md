@@ -123,6 +123,9 @@ If a shelter boundary exists in Supabase (`shelter_boundaries.polygon_geojson`),
 The base station can send:
 - **Out of bounds** notification (when the GPS first goes outside the box)
 - **Low battery** notification (when `battery < 10%`)
+- **Tracker disconnected** notification (when no tracker heartbeat is received for more than 90 seconds)
+- **Tracker back online** notification (when a disconnected tracker reports again)
+- **Dog back in bounds** notification (when a previously out-of-bounds tracker returns to the safe area)
 
 Important note: the “Force OOB” button is only a demo toggle. The base station sends a flag to the ESP32, and the ESP32 is the one that starts reporting GPS outside the bounding box (so the data flow stays realistic).
 Extra note: “Force Low Batt” is a server-side demo toggle (no ESP32 code change needed). It makes the dashboard/alerts treat the device as low battery for testing notifications.
