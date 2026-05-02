@@ -1022,8 +1022,8 @@
             return Math.max(10, Math.min(50, n));
         }
 
-        function activeBboxFromConfig() {
-            const cfg = currentConfig || {};
+        function bboxFromConfig(cfg) {
+            cfg = cfg || {};
             if ((cfg.gps_mode || "").toString().toLowerCase() !== "bbox") return null;
             const bbox = cfg.gps_bbox || {};
             const minLat = Number(bbox.min_lat);
@@ -1033,6 +1033,10 @@
             if (![minLat, maxLat, minLng, maxLng].every(Number.isFinite)) return null;
             if (!(maxLat > minLat && maxLng > minLng)) return null;
             return { minLat, maxLat, minLng, maxLng };
+        }
+
+        function activeBboxFromConfig() {
+            return bboxFromConfig(currentConfig);
         }
 
         function mapJumpLimitMeters(bbox) {
@@ -1357,8 +1361,11 @@ document.getElementById("statOOB").textContent = oob;
                     return;
                 }
 
-                const bbox = activeBboxFromConfig();
-                const trailPoints = recentContinuousTrail(points, bbox);
+                if (payload.config && typeof payload.config === "object") {
+                    currentConfig = payload.config;
+                }
+                const bbox = bboxFromConfig(payload.config) || activeBboxFromConfig();
+                const trailPoints = forceLow ? [] : recentContinuousTrail(points, bbox);
                 const trail = trailPoints.map(p => [p.gps.lat, p.gps.lng]);
                 if (trail.length > 1) {
                     L.polyline(trail, {
@@ -1671,7 +1678,11 @@ document.getElementById("statOOB").textContent = oob;
                         const isExpectedNameMatch = !!expectedName && deviceNameLc === expectedName;
                         if (isNewDevice || isExpectedNameMatch) {
                             try {
-                                await fetch(`/device/${encodeURIComponent(d.device_id)}/claim`, { method: "POST" });
+                                await fetch(`/device/${encodeURIComponent(d.device_id)}/claim`, {
+                                    method: "POST",
+                                    headers: { "Content-Type": "application/json" },
+                                    body: JSON.stringify({ reset_history: !isNewDevice && isExpectedNameMatch }),
+                                });
                             } catch (_) {
                                 // best effort
                             }

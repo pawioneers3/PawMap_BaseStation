@@ -5,6 +5,7 @@ import os
 import secrets
 import sqlite3
 import time
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Any, Optional
@@ -18,15 +19,20 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret-change-me")
 
 try:
-    from supabase import Client, create_client  # type: ignore
+    from supabase import Client, create_client
 except Exception:
-    Client = Any  # type: ignore
-    create_client = None  # type: ignore
+    Client = Any
+    create_client = None
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+SUPABASE_KEY = os.environ.get(
+    "SUPABASE_KEY") or os.environ.get("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-supabase_client: Optional[Client] = None  # type: ignore[valid-type]
+SUPABASE_TRACKER_INGEST_URL = (
+    os.environ.get("SUPABASE_TRACKER_INGEST_URL")
+    or (f"{SUPABASE_URL.rstrip('/')}/functions/v1/tracker-ingest" if SUPABASE_URL else "")
+)
+supabase_client: Optional[Client] = None
 if create_client and SUPABASE_URL:
     for candidate_key in (SUPABASE_KEY, SUPABASE_SERVICE_ROLE_KEY):
         if not candidate_key:
@@ -46,14 +52,14 @@ if create_client and SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
         supabase_admin_client = None
 
 DB_PATH = BASE_DIR / "basestation.db"
-NOTIFY_COOLDOWN_S = 60
+NOTIFY_COOLDOWN_S = 30
 BATTERY_LOW_THRESHOLD = 10
 
-# Global mock config pushed down to devices (dog tracker demo).
+
 server_config: dict[str, Any] = {
-    "gps_center": {"lat": 14.5995, "lng": 120.9842},  # fallback/default
+    "gps_center": {"lat": 14.5995, "lng": 120.9842},
     "gps_radius_m": 150.0,
-    # Bounding box for the current demo area (test grid).
+
     "gps_bbox": {
         "min_lat": 10.657589126982737,
         "max_lat": 10.65811214392038,
@@ -539,6 +545,69 @@ def _resolve_pending_claim_user_id_by_token(claim_token: str, now_ts: float) -> 
         return str(row["user_id"])
 
 
+def _pending_claim_user_id(
+    *,
+    claim_token: str = "",
+    expected_name: str = "",
+    now_ts: float,
+) -> Optional[str]:
+    if not claim_token and not expected_name:
+        return None
+    with _db() as conn:
+        if claim_token:
+            row = conn.execute(
+                """
+                SELECT user_id
+                FROM pairing_claims
+                WHERE claim_token = ?
+                  AND claimed_at IS NULL
+                  AND expires_at >= ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (claim_token, now_ts),
+            ).fetchone()
+            if row and row["user_id"]:
+                return str(row["user_id"])
+        if expected_name:
+            row = conn.execute(
+                """
+                SELECT user_id
+                FROM pairing_claims
+                WHERE expected_name = ?
+                  AND claimed_at IS NULL
+                  AND expires_at >= ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (expected_name, now_ts),
+            ).fetchone()
+            if row and row["user_id"]:
+                return str(row["user_id"])
+    return None
+
+
+def _reset_device_tracking_state(conn: sqlite3.Connection, device_id: str, now_ts: float) -> None:
+    conn.execute("DELETE FROM readings WHERE device_id = ?", (device_id,))
+    conn.execute("DELETE FROM notifications WHERE device_id = ?", (device_id,))
+    conn.execute(
+        """
+        UPDATE devices
+        SET first_seen = ?,
+            last_oob = NULL,
+            last_notify_ts = 0,
+            last_batt_low = NULL,
+            last_batt_notify_ts = 0,
+            force_oob = 0,
+            force_low_battery = 0,
+            freeze_lat = NULL,
+            freeze_lng = NULL
+        WHERE device_id = ?
+        """,
+        (now_ts, device_id),
+    )
+
+
 def _supabase_target_user_ids_for_alerts(device_id: Optional[str] = None) -> list[str]:
     # Optional explicit override to keep demo routing simple.
     env_ids = (os.environ.get("SUPABASE_NOTIFY_USER_IDS") or "").strip()
@@ -614,6 +683,159 @@ def _send_supabase_notification(
             failed += 1
 
     return {"enabled": True, "sent": sent, "failed": failed, "reason": "ok"}
+
+
+def _tracker_location_payload(
+    *,
+    device_id: str,
+    name: str,
+    lat: Optional[float],
+    lng: Optional[float],
+    battery: Optional[int],
+    effective_battery: Optional[int],
+    battery_health: Optional[str],
+    battery_low: Optional[bool],
+    geofence: Optional[dict[str, Any]],
+    status: Optional[str],
+    recorded_ts: float,
+) -> dict[str, Any]:
+    recorded_at = datetime.fromtimestamp(
+        recorded_ts, timezone.utc).isoformat().replace("+00:00", "Z")
+    return {
+        "device_id": device_id,
+        "name": name,
+        "gps": {"lat": lat, "lng": lng},
+        "battery": battery,
+        "effective_battery": effective_battery,
+        "battery_health": battery_health,
+        "battery_low": battery_low,
+        "geofence": geofence or {},
+        "status": status,
+        "recorded_at": recorded_at,
+    }
+
+
+def _animal_location_insert_rows(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    gps = payload.get("gps") if isinstance(payload.get("gps"), dict) else {}
+    base_row = {
+        "tracker_id": payload.get("device_id"),
+        "animal_id": payload.get("name"),
+        "latitude": gps.get("lat"),
+        "longitude": gps.get("lng"),
+        "recorded_at": payload.get("recorded_at"),
+        "battery": payload.get("battery"),
+    }
+    enriched_row = {
+        **base_row,
+        "effective_battery": payload.get("effective_battery"),
+        "battery_health": payload.get("battery_health"),
+        "battery_low": payload.get("battery_low"),
+        "status": payload.get("status"),
+        "geofence": payload.get("geofence"),
+    }
+    return base_row, enriched_row
+
+
+def _insert_supabase_animal_location_direct(payload: dict[str, Any]) -> dict[str, Any]:
+    client = supabase_admin_client
+    if not client:
+        return {"enabled": False, "ok": False, "reason": "missing_service_role_client"}
+
+    gps = payload.get("gps") if isinstance(payload.get("gps"), dict) else {}
+    if gps.get("lat") is None or gps.get("lng") is None:
+        return {"enabled": True, "ok": False, "reason": "missing_gps"}
+
+    base_row, enriched_row = _animal_location_insert_rows(payload)
+    try:
+        client.table("animal_locations").insert(enriched_row).execute()
+        return {"enabled": True, "ok": True, "path": "direct", "mode": "enriched"}
+    except Exception as enriched_error:
+        try:
+            client.table("animal_locations").insert(base_row).execute()
+            return {
+                "enabled": True,
+                "ok": True,
+                "path": "direct",
+                "mode": "base",
+                "enriched_error": str(enriched_error)[:500],
+            }
+        except Exception as base_error:
+            return {
+                "enabled": True,
+                "ok": False,
+                "path": "direct",
+                "reason": str(base_error)[:500],
+                "enriched_error": str(enriched_error)[:500],
+            }
+
+
+def _send_supabase_tracker_heartbeat(
+    *,
+    device_id: str,
+    name: str,
+    lat: Optional[float],
+    lng: Optional[float],
+    battery: Optional[int],
+    effective_battery: Optional[int],
+    battery_health: Optional[str],
+    battery_low: Optional[bool],
+    geofence: Optional[dict[str, Any]],
+    status: Optional[str],
+    recorded_ts: float,
+) -> dict[str, Any]:
+    if lat is None or lng is None:
+        return {"enabled": True, "ok": False, "reason": "missing_gps"}
+
+    payload = _tracker_location_payload(
+        device_id=device_id,
+        name=name,
+        lat=lat,
+        lng=lng,
+        battery=battery,
+        effective_battery=effective_battery,
+        battery_health=battery_health,
+        battery_low=battery_low,
+        geofence=geofence,
+        status=status,
+        recorded_ts=recorded_ts,
+    )
+
+    direct_result = _insert_supabase_animal_location_direct(payload)
+    if direct_result.get("ok") is True:
+        return {**direct_result, "edge": {"skipped": True, "reason": "direct_insert_ok"}}
+
+    if not SUPABASE_TRACKER_INGEST_URL:
+        return {**direct_result, "edge": {"enabled": False, "ok": False, "reason": "missing_ingest_url"}}
+    if not SUPABASE_KEY:
+        return {**direct_result, "edge": {"enabled": False, "ok": False, "reason": "missing_supabase_key"}}
+
+    try:
+        import requests  # type: ignore
+    except Exception:
+        return {**direct_result, "edge": {"enabled": False, "ok": False, "reason": "missing_requests"}}
+
+    try:
+        resp = requests.post(
+            SUPABASE_TRACKER_INGEST_URL,
+            headers={
+                "Content-Type": "application/json",
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+            },
+            json=payload,
+            timeout=6,
+        )
+        ok = 200 <= resp.status_code < 300
+        return {
+            "enabled": True,
+            "ok": ok,
+            "path": "edge",
+            "direct": direct_result,
+            "status_code": resp.status_code,
+            "response": resp.text[:500],
+        }
+    except Exception as e:
+        return {**direct_result, "edge": {"enabled": True, "ok": False, "reason": f"exception:{e!r}"}}
 
 
 def _fcm_runtime_status() -> dict[str, Any]:
@@ -1347,8 +1569,17 @@ def receive_data():
     notify_data: dict[str, Any] = {}
     should_notify = False
     force_oob_bool = False
+    fresh_pairing = False
     name = ""
     shelter_user_id: Optional[str] = None
+    heartbeat_lat: Optional[float] = None
+    heartbeat_lng: Optional[float] = None
+    heartbeat_battery: Optional[int] = None
+    heartbeat_effective_battery: Optional[int] = None
+    heartbeat_battery_health: Optional[str] = None
+    heartbeat_battery_low: Optional[bool] = None
+    heartbeat_geofence: Optional[dict[str, Any]] = None
+    heartbeat_status: Optional[str] = None
     with _db() as conn:
         row = conn.execute(
             """
@@ -1378,11 +1609,19 @@ def receive_data():
         name = incoming_name or stored_name or _default_name(device_id)
         force_oob_bool = bool(force_oob)
 
-        if not shelter_user_id and incoming_claim_token:
-            shelter_user_id = _resolve_pending_claim_user_id_by_token(
-                incoming_claim_token, now)
-        if not shelter_user_id:
-            shelter_user_id = _resolve_pending_claim_user_id(name, now)
+        if incoming_claim_token:
+            pending_user_id = _pending_claim_user_id(
+                claim_token=incoming_claim_token, now_ts=now)
+            if pending_user_id and (not shelter_user_id or pending_user_id == shelter_user_id):
+                shelter_user_id = _resolve_pending_claim_user_id_by_token(
+                    incoming_claim_token, now)
+                fresh_pairing = shelter_user_id == pending_user_id
+        if not fresh_pairing and (not shelter_user_id or row):
+            pending_user_id = _pending_claim_user_id(
+                expected_name=name, now_ts=now)
+            if pending_user_id and (not shelter_user_id or pending_user_id == shelter_user_id):
+                shelter_user_id = _resolve_pending_claim_user_id(name, now)
+                fresh_pairing = shelter_user_id == pending_user_id
 
         # Upsert device.
         if row:
@@ -1390,6 +1629,17 @@ def receive_data():
                 "UPDATE devices SET name = ?, last_seen = ?, shelter_user_id = COALESCE(shelter_user_id, ?) WHERE device_id = ?",
                 (name, now, shelter_user_id, device_id),
             )
+            if fresh_pairing:
+                _reset_device_tracking_state(conn, device_id, now)
+                force_oob = 0
+                force_low_battery = 0
+                freeze_lat = None
+                freeze_lng = None
+                prev_oob = None
+                last_notify_ts = 0.0
+                prev_batt_low = None
+                last_batt_notify_ts = 0.0
+                force_oob_bool = False
         else:
             conn.execute(
                 """
@@ -1439,6 +1689,9 @@ def receive_data():
             battery_i = int(battery) if battery is not None else None
         except Exception:
             battery_i = None
+        heartbeat_lat = lat_f
+        heartbeat_lng = lng_f
+        heartbeat_battery = battery_i
 
         status = data.get("status")
         status_s = str(status) if status is not None else None
@@ -1454,6 +1707,7 @@ def receive_data():
         # Update last_oob + possibly trigger notification.
         geofence_config = _effective_server_config_for_user(shelter_user_id)
         geofence = _compute_geofence(data, geofence_config)
+        heartbeat_geofence = geofence
         out = geofence.get("out_of_bounds")
         out_i = 1 if out is True else 0 if out is False else None
         conn.execute(
@@ -1475,6 +1729,24 @@ def receive_data():
             batt_low = 1 if effective_battery_i < BATTERY_LOW_THRESHOLD else 0
         else:
             batt_low = None
+        heartbeat_effective_battery = effective_battery_i
+        heartbeat_battery_low = bool(batt_low) if batt_low is not None else None
+        heartbeat_battery_health = (
+            None
+            if effective_battery_i is None
+            else "critical"
+            if effective_battery_i < BATTERY_LOW_THRESHOLD
+            else "low"
+            if effective_battery_i <= 20
+            else "good"
+        )
+        heartbeat_status = (
+            "out_of_bounds"
+            if out is True
+            else "in_bounds"
+            if out is False
+            else "unknown"
+        )
         conn.execute(
             "UPDATE devices SET last_batt_low = ? WHERE device_id = ?",
             (batt_low, device_id),
@@ -1532,6 +1804,20 @@ def receive_data():
                 (now, device_id),
             )
 
+    heartbeat_result = _send_supabase_tracker_heartbeat(
+        device_id=device_id,
+        name=name,
+        lat=heartbeat_lat,
+        lng=heartbeat_lng,
+        battery=heartbeat_battery,
+        effective_battery=heartbeat_effective_battery,
+        battery_health=heartbeat_battery_health,
+        battery_low=heartbeat_battery_low,
+        geofence=heartbeat_geofence,
+        status=heartbeat_status,
+        recorded_ts=now,
+    )
+
     response_config = _effective_server_config_for_user(shelter_user_id)
     response_config["force_oob"] = bool(force_oob)
 
@@ -1554,7 +1840,7 @@ def receive_data():
             route_path="/(shelter)/notifications",
             payload=notify_data,
         )
-    return jsonify({"status": "ok", "config": response_config})
+    return jsonify({"status": "ok", "config": response_config, "tracker_ingest": heartbeat_result})
 
 
 @app.post("/device/<device_id>/oob")
@@ -1639,6 +1925,9 @@ def set_device_low_battery(device_id: str):
 @app.post("/device/<device_id>/claim")
 @require_web_session_api
 def claim_device(device_id: str):
+    payload = request.get_json(silent=True)
+    reset_history = bool(payload.get("reset_history")) if isinstance(
+        payload, dict) else False
     user = getattr(request, "user", None)
     user_id = str(getattr(user, "id", "") or "")
     if not user_id:
@@ -1655,6 +1944,8 @@ def claim_device(device_id: str):
         ) if row["shelter_user_id"] else ""
         if owner_id and owner_id != user_id:
             return jsonify({"status": "error", "error": "owned_by_other_shelter"}), 409
+        if reset_history:
+            _reset_device_tracking_state(conn, device_id, time.time())
         conn.execute(
             "UPDATE devices SET shelter_user_id = ? WHERE device_id = ?",
             (user_id, device_id),
@@ -1847,24 +2138,24 @@ def history(device_id: str):
         if not owner_row or str(owner_row["shelter_user_id"] or "") != user_id:
             return jsonify({"status": "error", "error": "not_found"}), 404
 
+        drow = conn.execute(
+            "SELECT device_id, name, first_seen, last_seen FROM devices WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+        if not drow:
+            return jsonify({"status": "error", "error": "not_found"}), 404
+
         rows = conn.execute(
             """
             SELECT ts, status, battery, lat, lng, raw_json
             FROM readings
             WHERE device_id = ?
+              AND ts >= ?
             ORDER BY ts DESC
             LIMIT ?
             """,
-            (device_id, limit_i),
+            (device_id, float(drow["first_seen"]), limit_i),
         ).fetchall()
-
-        drow = conn.execute(
-            "SELECT device_id, name, first_seen, last_seen FROM devices WHERE device_id = ?",
-            (device_id,),
-        ).fetchone()
-
-    if not drow:
-        return jsonify({"status": "error", "error": "not_found"}), 404
 
     points: list[dict[str, Any]] = []
     for r in rows:
@@ -1893,6 +2184,7 @@ def history(device_id: str):
                 "first_seen": float(drow["first_seen"]),
                 "last_seen": float(drow["last_seen"]),
             },
+            "config": _effective_server_config_for_user(user_id),
             "points": points,
         }
     )
