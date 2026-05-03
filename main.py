@@ -144,6 +144,7 @@ def _init_db() -> None:
                 user_id TEXT NOT NULL,
                 expected_name TEXT NOT NULL,
                 claim_token TEXT,
+                replace_existing INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 expires_at REAL NOT NULL,
                 claimed_device_id TEXT,
@@ -224,6 +225,11 @@ def _init_db() -> None:
         try:
             conn.execute(
                 "ALTER TABLE pairing_claims ADD COLUMN claim_token TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                "ALTER TABLE pairing_claims ADD COLUMN replace_existing INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
         try:
@@ -566,6 +572,66 @@ def _resolve_pending_claim_user_id_by_token(claim_token: str, now_ts: float) -> 
         return str(row["user_id"])
 
 
+def _pending_pairing_claim(
+    *,
+    claim_token: str = "",
+    expected_name: str = "",
+    now_ts: float,
+) -> Optional[dict[str, Any]]:
+    if not claim_token and not expected_name:
+        return None
+    with _db() as conn:
+        if claim_token:
+            row = conn.execute(
+                """
+                SELECT id, user_id, expected_name, replace_existing
+                FROM pairing_claims
+                WHERE claim_token = ?
+                  AND claimed_at IS NULL
+                  AND expires_at >= ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (claim_token, now_ts),
+            ).fetchone()
+            if row:
+                return {
+                    "id": int(row["id"]),
+                    "user_id": str(row["user_id"]),
+                    "expected_name": str(row["expected_name"] or ""),
+                    "replace_existing": bool(row["replace_existing"] or 0),
+                }
+        if expected_name:
+            row = conn.execute(
+                """
+                SELECT id, user_id, expected_name, replace_existing
+                FROM pairing_claims
+                WHERE expected_name = ?
+                  AND claimed_at IS NULL
+                  AND expires_at >= ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (expected_name, now_ts),
+            ).fetchone()
+            if row:
+                return {
+                    "id": int(row["id"]),
+                    "user_id": str(row["user_id"]),
+                    "expected_name": str(row["expected_name"] or ""),
+                    "replace_existing": bool(row["replace_existing"] or 0),
+                }
+    return None
+
+
+def _mark_pairing_claim_claimed(claim_id: int, device_id: str, now_ts: float) -> None:
+    with _db() as conn:
+        conn.execute(
+            "UPDATE pairing_claims SET claimed_at = ?, claimed_device_id = ? WHERE id = ?",
+            (now_ts, device_id, claim_id),
+        )
+
+
 def _pending_claim_user_id(
     *,
     claim_token: str = "",
@@ -630,6 +696,54 @@ def _reset_device_tracking_state(conn: sqlite3.Connection, device_id: str, now_t
         """,
         (now_ts, device_id),
     )
+
+
+def _pairing_name_conflicts(
+    conn: sqlite3.Connection,
+    *,
+    user_id: str,
+    expected_name: str,
+    exclude_device_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    params: list[Any] = [user_id, expected_name]
+    sql = """
+        SELECT device_id, name, last_seen
+        FROM devices
+        WHERE shelter_user_id = ?
+          AND LOWER(name) = LOWER(?)
+    """
+    if exclude_device_id:
+        sql += " AND device_id <> ?"
+        params.append(exclude_device_id)
+    sql += " ORDER BY last_seen DESC"
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    conflicts: list[dict[str, Any]] = []
+    now_ts = time.time()
+    for row in rows:
+        last_seen = float(row["last_seen"] or 0.0)
+        age_s = max(0.0, now_ts - last_seen) if last_seen else None
+        status = "online" if last_seen and age_s is not None and age_s <= OFFLINE_TIMEOUT_S else "offline"
+        conflicts.append(
+            {
+                "device_id": str(row["device_id"]),
+                "name": str(row["name"] or ""),
+                "last_seen": last_seen,
+                "status": status,
+            }
+        )
+    return conflicts
+
+
+def _delete_supabase_tracker_records(device_id: str) -> dict[str, Any]:
+    client = supabase_admin_client
+    if not client:
+        return {"enabled": False, "ok": False, "reason": "missing_service_role_client"}
+    try:
+        result = client.table("animal_locations").delete().eq("tracker_id", device_id).execute()
+        rows = result.data if isinstance(result.data, list) else []
+        return {"enabled": True, "ok": True, "deleted_rows": len(rows)}
+    except Exception as exc:
+        return {"enabled": True, "ok": False, "reason": str(exc)[:500]}
 
 
 def _supabase_target_user_ids_for_alerts(device_id: Optional[str] = None) -> list[str]:
@@ -1657,6 +1771,7 @@ def pairing_start():
     expected_name = str(payload.get("expected_name") or "").strip()
     if not expected_name:
         return jsonify({"status": "error", "error": "missing_expected_name"}), 400
+    replace_existing = bool(payload.get("replace_existing"))
 
     ttl_s = max(30, min(600, _coerce_int(payload.get("ttl_s"), 180)))
     user = getattr(request, "user", None)
@@ -1673,17 +1788,51 @@ def pairing_start():
             "DELETE FROM pairing_claims WHERE expires_at < ? OR claimed_at IS NOT NULL", (now,))
         conn.execute(
             """
-            INSERT INTO pairing_claims(user_id, expected_name, claim_token, created_at, expires_at)
-            VALUES(?, ?, ?, ?, ?)
+            INSERT INTO pairing_claims(user_id, expected_name, claim_token, replace_existing, created_at, expires_at)
+            VALUES(?, ?, ?, ?, ?, ?)
             """,
-            (user_id, expected_name, claim_token, now, expires_at),
+            (user_id, expected_name, claim_token, 1 if replace_existing else 0, now, expires_at),
         )
     return jsonify(
         {
             "status": "ok",
             "expected_name": expected_name,
             "claim_token": claim_token,
+            "replace_existing": replace_existing,
             "expires_at": expires_at,
+        }
+    )
+
+
+@app.post("/pairing/check")
+@require_web_session_api
+def pairing_check():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"status": "error", "error": "invalid_json"}), 400
+
+    expected_name = str(payload.get("expected_name") or "").strip()
+    if not expected_name:
+        return jsonify({"status": "error", "error": "missing_expected_name"}), 400
+
+    user = getattr(request, "user", None)
+    user_id = str(getattr(user, "id", "") or "")
+    if not user_id:
+        return jsonify({"status": "error", "error": "unauthorized"}), 401
+
+    with _db() as conn:
+        conflicts = _pairing_name_conflicts(
+            conn,
+            user_id=user_id,
+            expected_name=expected_name,
+        )
+
+    return jsonify(
+        {
+            "status": "ok",
+            "expected_name": expected_name,
+            "has_conflict": bool(conflicts),
+            "conflicts": conflicts,
         }
     )
 
@@ -1716,6 +1865,9 @@ def receive_data():
     heartbeat_battery_low: Optional[bool] = None
     heartbeat_geofence: Optional[dict[str, Any]] = None
     heartbeat_status: Optional[str] = None
+    pending_claim_id: Optional[int] = None
+    replace_existing_pairing = False
+    replaced_devices: list[str] = []
     with _db() as conn:
         row = conn.execute(
             """
@@ -1749,19 +1901,18 @@ def receive_data():
         name = incoming_name or stored_name or _default_name(device_id)
         force_oob_bool = bool(force_oob)
 
-        if incoming_claim_token:
-            pending_user_id = _pending_claim_user_id(
-                claim_token=incoming_claim_token, now_ts=now)
-            if pending_user_id and (not shelter_user_id or pending_user_id == shelter_user_id):
-                shelter_user_id = _resolve_pending_claim_user_id_by_token(
-                    incoming_claim_token, now)
-                fresh_pairing = shelter_user_id == pending_user_id
-        if not fresh_pairing and (not shelter_user_id or row):
-            pending_user_id = _pending_claim_user_id(
-                expected_name=name, now_ts=now)
-            if pending_user_id and (not shelter_user_id or pending_user_id == shelter_user_id):
-                shelter_user_id = _resolve_pending_claim_user_id(name, now)
-                fresh_pairing = shelter_user_id == pending_user_id
+        pending_claim = _pending_pairing_claim(
+            claim_token=incoming_claim_token,
+            expected_name=name,
+            now_ts=now,
+        )
+        if pending_claim:
+            pending_user_id = str(pending_claim["user_id"])
+            if not shelter_user_id or pending_user_id == shelter_user_id:
+                shelter_user_id = pending_user_id
+                fresh_pairing = True
+                pending_claim_id = int(pending_claim["id"])
+                replace_existing_pairing = bool(pending_claim["replace_existing"])
 
         # Upsert device.
         if row:
@@ -1776,19 +1927,6 @@ def receive_data():
                 """,
                 (name, now, shelter_user_id, device_id),
             )
-            if fresh_pairing:
-                _reset_device_tracking_state(conn, device_id, now)
-                force_oob = 0
-                force_low_battery = 0
-                freeze_lat = None
-                freeze_lng = None
-                prev_oob = None
-                last_notify_ts = 0.0
-                prev_batt_low = None
-                last_batt_notify_ts = 0.0
-                prev_offline = 0
-                last_recovery_notify_ts = 0.0
-                force_oob_bool = False
         else:
             conn.execute(
                 """
@@ -1798,6 +1936,24 @@ def receive_data():
                 (device_id, name, shelter_user_id, now, now,
                  force_oob, force_low_battery, None, None),
             )
+
+        if pending_claim_id is not None:
+            conn.execute(
+                "UPDATE pairing_claims SET claimed_at = ?, claimed_device_id = ? WHERE id = ?",
+                (now, device_id, pending_claim_id),
+            )
+
+        if replace_existing_pairing and shelter_user_id:
+            conflicts = _pairing_name_conflicts(
+                conn,
+                user_id=shelter_user_id,
+                expected_name=name,
+                exclude_device_id=device_id,
+            )
+            for conflict in conflicts:
+                conflict_device_id = str(conflict["device_id"])
+                conn.execute("DELETE FROM devices WHERE device_id = ?", (conflict_device_id,))
+                replaced_devices.append(conflict_device_id)
 
         def push_tokens_for_device() -> list[str]:
             rows = conn.execute(
@@ -2007,6 +2163,9 @@ def receive_data():
                 (now, device_id),
             )
 
+    for replaced_device_id in replaced_devices:
+        _delete_supabase_tracker_records(replaced_device_id)
+
     heartbeat_result = _send_supabase_tracker_heartbeat(
         device_id=device_id,
         name=name,
@@ -2162,16 +2321,26 @@ def claim_device(device_id: str):
 def delete_device(device_id: str):
     user = getattr(request, "user", None)
     user_id = str(getattr(user, "id", "") or "")
+    deleted_name = ""
     with _db() as conn:
         row = conn.execute(
-            "SELECT device_id FROM devices WHERE device_id = ? AND shelter_user_id = ?",
+            "SELECT device_id, name FROM devices WHERE device_id = ? AND shelter_user_id = ?",
             (device_id, user_id),
         ).fetchone()
         if not row:
             return jsonify({"status": "error", "error": "not_found"}), 404
+        deleted_name = str(row["name"] or "")
         conn.execute("DELETE FROM devices WHERE device_id = ?", (device_id,))
+    supabase_result = _delete_supabase_tracker_records(device_id)
 
-    return jsonify({"status": "ok", "device_id": device_id})
+    return jsonify(
+        {
+            "status": "ok",
+            "device_id": device_id,
+            "name": deleted_name,
+            "supabase": supabase_result,
+        }
+    )
 
 
 @app.post("/fcm/register")

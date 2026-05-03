@@ -1616,6 +1616,7 @@ document.getElementById("statOOB").textContent = oob;
             const password = document.getElementById("wifiPassword").value;
             let name = document.getElementById("deviceName").value.trim();
             const serverIp = document.getElementById("serverIp").value.trim();
+            let replaceExisting = false;
 
             if (!ssid || !serverIp) {
                 statusEl.textContent = "Please fill WiFi SSID and Base Station IP.";
@@ -1625,6 +1626,33 @@ document.getElementById("statOOB").textContent = oob;
                 const suffix = Math.floor(Math.random() * 9000 + 1000);
                 name = `Dog-${suffix}`;
                 document.getElementById("deviceName").value = name;
+            }
+
+            statusEl.textContent = "Checking for existing tracker names...";
+            try {
+                const checkResp = await fetch("/pairing/check", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ expected_name: name }),
+                });
+                const checkJson = await checkResp.json().catch(() => ({}));
+                const conflicts = Array.isArray(checkJson?.conflicts) ? checkJson.conflicts : [];
+                if (conflicts.length) {
+                    const conflict = conflicts[0];
+                    const conflictName = conflict?.name || name;
+                    const conflictDeviceId = conflict?.device_id || "unknown";
+                    const conflictStatus = conflict?.status || "unknown";
+                    const ok = confirm(
+                        `The name "${conflictName}" already exists on device ${conflictDeviceId} (${conflictStatus}). Replace that tracker with this pairing?`
+                    );
+                    if (!ok) {
+                        statusEl.textContent = "Pairing cancelled.";
+                        return;
+                    }
+                    replaceExisting = true;
+                }
+            } catch (_) {
+                // best effort: skip warning if the check fails
             }
 
             statusEl.textContent = "Capturing current device list...";
@@ -1641,7 +1669,7 @@ document.getElementById("statOOB").textContent = oob;
                 const claimResp = await fetch("/pairing/start", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ expected_name: name, ttl_s: 180 }),
+                    body: JSON.stringify({ expected_name: name, ttl_s: 180, replace_existing: replaceExisting }),
                 });
                 const claimJson = await claimResp.json().catch(() => ({}));
                 claimToken = claimJson?.claim_token || null;
@@ -1681,7 +1709,7 @@ document.getElementById("statOOB").textContent = oob;
                                 await fetch(`/device/${encodeURIComponent(d.device_id)}/claim`, {
                                     method: "POST",
                                     headers: { "Content-Type": "application/json" },
-                                    body: JSON.stringify({ reset_history: !isNewDevice && isExpectedNameMatch }),
+                                    body: JSON.stringify({ reset_history: false }),
                                 });
                             } catch (_) {
                                 // best effort
@@ -1777,13 +1805,17 @@ document.getElementById("statOOB").textContent = oob;
             const btn = e.target.closest(".delBtn");
             if (!btn) return;
             const deviceId = btn.dataset.id;
-            const ok = confirm(`Remove device ${deviceId}? This deletes it from the base station database (history too).`);
+            const ok = confirm(`Remove device ${deviceId}? This deletes it from the base station database and synced Supabase tracker history.`);
             if (!ok) return;
             btn.disabled = true;
             btn.textContent = "Removing...";
             try {
                 const resp = await fetch(`/device/${encodeURIComponent(deviceId)}`, { method: "DELETE" });
                 if (!resp.ok) throw new Error("delete_failed");
+                const payload = await resp.json().catch(() => ({}));
+                if (payload?.supabase?.enabled && payload?.supabase?.ok === false) {
+                    alert(`Device removed locally, but Supabase cleanup failed: ${payload.supabase.reason || "unknown error"}`);
+                }
             } catch (_) {
                 // ignore
             } finally {
