@@ -1605,9 +1605,14 @@ def shelter_dashboard() -> Any:
 @require_web_session_api
 def list_devices():
     if not supabase_client:
-        return jsonify({"devices": [], "source": "local", "error": "supabase_unavailable"})
+        return jsonify({
+            "devices": [],
+            "source": "supabase",
+            "error": "supabase_unavailable"
+        })
 
-    rows = []
+    effective_cfg = _effective_server_config_for_request()
+
     try:
         result = (
             supabase_client
@@ -1619,7 +1624,11 @@ def list_devices():
         )
         rows = result.data or []
     except Exception as e:
-        return jsonify({"devices": [], "source": "supabase", "error": str(e)}), 500
+        return jsonify({
+            "devices": [],
+            "source": "supabase",
+            "error": str(e)
+        }), 500
 
     latest_by_tracker = {}
 
@@ -1640,6 +1649,14 @@ def list_devices():
         battery = row.get("battery")
         recorded_at = row.get("recorded_at")
 
+        last_seen_ts = 0.0
+        try:
+            dt = datetime.fromisoformat(
+                str(recorded_at).replace("Z", "+00:00"))
+            last_seen_ts = dt.timestamp()
+        except Exception:
+            last_seen_ts = 0.0
+
         data = {
             "device_id": tracker_id,
             "name": name,
@@ -1651,17 +1668,21 @@ def list_devices():
             "gps_source": "supabase",
         }
 
-        devices_view.append({
-            "device_id": tracker_id,
-            "name": name,
-            "last_seen": recorded_at,
-            "status": row.get("status") or "unknown",
-            "data": data,
-            "geofence": row.get("geofence") or {},
-            "force_oob": False,
-            "force_low_battery": False,
-            "location_frozen": False,
-        })
+        devices_view.append(
+            _device_view(
+                tracker_id,
+                {
+                    "last_seen": last_seen_ts,
+                    "data": data,
+                    "name": name,
+                    "force_oob": 0,
+                    "force_low_battery": 0,
+                    "freeze_lat": None,
+                    "freeze_lng": None,
+                },
+                effective_cfg,
+            )
+        )
 
     return jsonify({
         "devices": devices_view,
