@@ -54,7 +54,8 @@ if create_client and SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
 
 DB_PATH = BASE_DIR / "basestation.db"
 NOTIFY_COOLDOWN_S = 30
-BATTERY_LOW_THRESHOLD = 10
+BATTERY_LOW_THRESHOLD = 20
+BATTERY_EMPTY_THRESHOLD = 0
 OFFLINE_TIMEOUT_S = 90
 OFFLINE_MONITOR_INTERVAL_S = 15
 
@@ -102,6 +103,24 @@ def _coerce_int(v: Any, default: int) -> int:
         return int(v)
     except Exception:
         return default
+
+
+def _is_low_battery(value: Optional[int]) -> bool:
+    return value is not None and value <= BATTERY_LOW_THRESHOLD
+
+
+def _is_empty_battery(value: Optional[int]) -> bool:
+    return value is not None and value <= BATTERY_EMPTY_THRESHOLD
+
+
+def _battery_health(value: Optional[int]) -> Optional[str]:
+    if value is None:
+        return None
+    if _is_empty_battery(value):
+        return "empty"
+    if _is_low_battery(value):
+        return "low"
+    return "good"
 
 
 def _db() -> sqlite3.Connection:
@@ -753,6 +772,49 @@ def _rename_supabase_tracker_records(device_id: str, name: str) -> dict[str, Any
         return {"enabled": False, "ok": False, "reason": "missing_service_role_client"}
     if not device_id or not name:
         return {"enabled": True, "ok": False, "reason": "missing_device_id_or_name"}
+    updated_geofence_rows = 0
+    geofence_failed = 0
+    try:
+        select_result = (
+            client.table("animal_locations")
+            .select("id, geofence")
+            .eq("tracker_id", device_id)
+            .execute()
+        )
+        for row in select_result.data or []:
+            if not isinstance(row, dict) or not row.get("id"):
+                continue
+            geofence = row.get("geofence")
+            if isinstance(geofence, str):
+                try:
+                    geofence = json.loads(geofence)
+                except Exception:
+                    geofence = {}
+            if not isinstance(geofence, dict):
+                geofence = {}
+            updated_geofence = _geofence_with_tracker_meta(
+                geofence,
+                device_id=device_id,
+                name=name,
+                shelter_user_id=_row_owner_user_id(row),
+                force_oob=bool(_row_tracker_meta(row).get("force_oob") or False),
+                force_low_battery=bool(_row_tracker_meta(row).get("force_low_battery") or False),
+                freeze_lat=_row_tracker_meta(row).get("freeze_lat"),
+                freeze_lng=_row_tracker_meta(row).get("freeze_lng"),
+            )
+            try:
+                (
+                    client.table("animal_locations")
+                    .update({"geofence": updated_geofence})
+                    .eq("id", row["id"])
+                    .execute()
+                )
+                updated_geofence_rows += 1
+            except Exception:
+                geofence_failed += 1
+    except Exception:
+        geofence_failed += 1
+
     try:
         result = (
             client.table("animal_locations")
@@ -761,7 +823,16 @@ def _rename_supabase_tracker_records(device_id: str, name: str) -> dict[str, Any
             .execute()
         )
         rows = result.data if isinstance(result.data, list) else []
-        return {"enabled": True, "ok": True, "updated_rows": len(rows), "mode": "with_name"}
+        notifications_result = _rename_supabase_notification_records(device_id, name)
+        return {
+            "enabled": True,
+            "ok": True,
+            "updated_rows": len(rows),
+            "updated_geofence_rows": updated_geofence_rows,
+            "geofence_failed": geofence_failed,
+            "notifications": notifications_result,
+            "mode": "with_name",
+        }
     except Exception as enriched_error:
         try:
             result = (
@@ -771,10 +842,14 @@ def _rename_supabase_tracker_records(device_id: str, name: str) -> dict[str, Any
                 .execute()
             )
             rows = result.data if isinstance(result.data, list) else []
+            notifications_result = _rename_supabase_notification_records(device_id, name)
             return {
                 "enabled": True,
                 "ok": True,
                 "updated_rows": len(rows),
+                "updated_geofence_rows": updated_geofence_rows,
+                "geofence_failed": geofence_failed,
+                "notifications": notifications_result,
                 "mode": "animal_id_only",
                 "enriched_error": str(enriched_error)[:500],
             }
@@ -783,8 +858,91 @@ def _rename_supabase_tracker_records(device_id: str, name: str) -> dict[str, Any
                 "enabled": True,
                 "ok": False,
                 "reason": str(exc)[:500],
+                "updated_geofence_rows": updated_geofence_rows,
+                "geofence_failed": geofence_failed,
                 "enriched_error": str(enriched_error)[:500],
             }
+
+
+def _rename_supabase_notification_records(device_id: str, name: str) -> dict[str, Any]:
+    client = supabase_admin_client
+    if not client:
+        return {"enabled": False, "ok": False, "reason": "missing_service_role_client"}
+    updated = 0
+    failed = 0
+    try:
+        result = (
+            client.table("notifications")
+            .select("id, message, payload")
+            .contains("payload", {"device_id": device_id})
+            .execute()
+        )
+    except Exception as exc:
+        try:
+            result = (
+                client.table("notifications")
+                .select("id, message, payload")
+                .contains("payload", {"tracker_id": device_id})
+                .execute()
+            )
+        except Exception as fallback_exc:
+            return {
+                "enabled": True,
+                "ok": False,
+                "reason": str(fallback_exc)[:500],
+                "primary_error": str(exc)[:500],
+                "updated_rows": 0,
+            }
+
+    for row in result.data or []:
+        if not isinstance(row, dict) or not row.get("id"):
+            continue
+        payload = row.get("payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload_device_id = str(
+            payload.get("device_id")
+            or payload.get("deviceId")
+            or payload.get("tracker_id")
+            or payload.get("trackerId")
+            or ""
+        ).strip()
+        if payload_device_id != device_id:
+            continue
+
+        old_name = str(
+            payload.get("name")
+            or payload.get("device_name")
+            or payload.get("deviceName")
+            or payload.get("animal_id")
+            or payload.get("animalId")
+            or ""
+        ).strip()
+        updated_payload = dict(payload)
+        updated_payload["name"] = name
+        updated_payload["animal_id"] = name
+        message = row.get("message")
+        updated_message = message
+        if isinstance(message, str) and old_name and old_name != name:
+            updated_message = message.replace(old_name, name)
+
+        try:
+            (
+                client.table("notifications")
+                .update({"payload": updated_payload, "message": updated_message})
+                .eq("id", row["id"])
+                .execute()
+            )
+            updated += 1
+        except Exception:
+            failed += 1
+
+    return {"enabled": True, "ok": failed == 0, "updated_rows": updated, "failed": failed}
 
 
 def _parse_supabase_ts(value: Any) -> float:
@@ -1196,6 +1354,9 @@ def _insert_supabase_control_snapshot(
 
     latest = _latest_supabase_tracker_row(device_id)
     if latest:
+        latest_name = _row_tracker_name(latest, device_id)
+        if latest_name and latest_name != name:
+            _rename_supabase_tracker_records(device_id, name)
         try:
             lat = float(latest.get("latitude")) if latest.get(
                 "latitude") is not None else None
@@ -1244,16 +1405,8 @@ def _insert_supabase_control_snapshot(
         effective_battery = forced_value if effective_battery is None else min(
             effective_battery, forced_value)
 
-    battery_low = None if effective_battery is None else effective_battery < BATTERY_LOW_THRESHOLD
-    battery_health = (
-        None
-        if effective_battery is None
-        else "critical"
-        if effective_battery < BATTERY_LOW_THRESHOLD
-        else "low"
-        if effective_battery <= 20
-        else "good"
-    )
+    battery_low = None if effective_battery is None else _is_low_battery(effective_battery)
+    battery_health = _battery_health(effective_battery)
 
     return _send_supabase_tracker_heartbeat(
         device_id=device_id,
@@ -1290,7 +1443,7 @@ def _sync_supabase_tracker_row_to_local(
         return None
 
     meta = _row_tracker_meta(row)
-    name = _row_tracker_name(row, tracker_id)
+    supabase_name = _row_tracker_name(row, tracker_id)
     last_seen_ts = _parse_supabase_ts(row.get("recorded_at"))
     if last_seen_ts <= 0:
         last_seen_ts = time.time()
@@ -1311,15 +1464,16 @@ def _sync_supabase_tracker_row_to_local(
         freeze_lng = None
 
     existing = conn.execute(
-        "SELECT device_id, first_seen FROM devices WHERE device_id = ?",
+        "SELECT device_id, first_seen, name FROM devices WHERE device_id = ?",
         (tracker_id,),
     ).fetchone()
     if existing:
+        local_name = str(existing["name"] or "").strip()
+        name = local_name or supabase_name
         conn.execute(
             """
             UPDATE devices
-            SET name = ?,
-                shelter_user_id = COALESCE(NULLIF(?, ''), shelter_user_id, ?),
+            SET shelter_user_id = COALESCE(NULLIF(?, ''), shelter_user_id, ?),
                 last_seen = MAX(last_seen, ?),
                 force_oob = ?,
                 force_low_battery = ?,
@@ -1328,7 +1482,6 @@ def _sync_supabase_tracker_row_to_local(
             WHERE device_id = ?
             """,
             (
-                name,
                 owner_id,
                 user_id,
                 last_seen_ts,
@@ -1340,6 +1493,7 @@ def _sync_supabase_tracker_row_to_local(
             ),
         )
     else:
+        name = supabase_name
         conn.execute(
             """
             INSERT INTO devices(device_id, name, shelter_user_id, first_seen, last_seen, force_oob, force_low_battery, freeze_lat, freeze_lng)
@@ -1378,6 +1532,10 @@ def _sync_supabase_tracker_row_to_local(
         "device_id": tracker_id,
         "name": name,
         "battery": battery_i,
+        "effective_battery": row.get("effective_battery"),
+        "battery_low": row.get("battery_low"),
+        "battery_health": row.get("battery_health"),
+        "status": row.get("status"),
         "gps": {"lat": lat_f, "lng": lng_f},
         "gps_source": "supabase",
         "geofence": _row_geofence(row),
@@ -1675,6 +1833,20 @@ def _device_view(
     if last_seen and age_s is not None and age_s <= OFFLINE_TIMEOUT_S:
         status = "online"
     else:
+        status = "offline"
+
+    battery_value: Optional[int] = None
+    for key in ("effective_battery", "battery"):
+        try:
+            raw_battery = data.get(key)
+            if raw_battery is not None:
+                battery_value = int(raw_battery)
+                break
+        except Exception:
+            continue
+    if _is_empty_battery(battery_value):
+        status = "offline"
+    elif str(data.get("status") or "").strip().lower() == "offline":
         status = "offline"
 
     return {
@@ -2335,7 +2507,7 @@ def receive_data():
             """
             SELECT name, shelter_user_id, force_oob, force_low_battery, freeze_lat, freeze_lng,
                    last_oob, last_notify_ts, last_batt_low, last_batt_notify_ts,
-                   last_offline, last_recovery_notify_ts
+                   last_offline, last_offline_notify_ts, last_recovery_notify_ts
             FROM devices
             WHERE device_id = ?
             """,
@@ -2358,6 +2530,8 @@ def receive_data():
         last_batt_notify_ts = float(
             row["last_batt_notify_ts"] or 0.0) if row else 0.0
         prev_offline = int(row["last_offline"] or 0) if row else 0
+        last_offline_notify_ts = float(
+            row["last_offline_notify_ts"] or 0.0) if row else 0.0
         last_recovery_notify_ts = float(
             row["last_recovery_notify_ts"] or 0.0) if row else 0.0
         # For an already-known tracker, keep the server-side name as the source
@@ -2500,6 +2674,10 @@ def receive_data():
                 (lat_f, lng_f, device_id),
             )
 
+        # Persist the canonical server-side name in local history too. The ESP32
+        # may still include an old setup name in its heartbeat payload.
+        data["name"] = name
+
         battery = data.get("battery")
         try:
             battery_i = int(battery) if battery is not None else None
@@ -2547,29 +2725,51 @@ def receive_data():
             else:
                 effective_battery_i = min(effective_battery_i, forced_value)
 
-        if effective_battery_i is not None:
-            batt_low = 1 if effective_battery_i < BATTERY_LOW_THRESHOLD else 0
-        else:
-            batt_low = None
+        batt_low = 1 if _is_low_battery(effective_battery_i) else 0 if effective_battery_i is not None else None
         heartbeat_effective_battery = effective_battery_i
         heartbeat_battery_low = bool(
             batt_low) if batt_low is not None else None
-        heartbeat_battery_health = (
-            None
-            if effective_battery_i is None
-            else "critical"
-            if effective_battery_i < BATTERY_LOW_THRESHOLD
-            else "low"
-            if effective_battery_i <= 20
-            else "good"
-        )
+        heartbeat_battery_health = _battery_health(effective_battery_i)
         heartbeat_status = (
+            "offline"
+            if _is_empty_battery(effective_battery_i)
+            else
             "out_of_bounds"
             if out is True
             else "in_bounds"
             if out is False
             else "unknown"
         )
+        if _is_empty_battery(effective_battery_i):
+            queued_notifications = [
+                notification
+                for notification in queued_notifications
+                if notification.get("kind") != "online"
+            ]
+            if (
+                prev_offline != 1
+                and (now - last_offline_notify_ts >= NOTIFY_COOLDOWN_S)
+            ):
+                notify_data = {
+                    "device_id": device_id,
+                    "name": name,
+                    "event": "offline",
+                    "battery": effective_battery_i,
+                    "reason": "battery_empty",
+                }
+                queued_notifications.append(
+                    {
+                        "kind": "offline",
+                        "title": "Tracker disconnected",
+                        "body": f"{name} battery is empty. The tracker is offline.",
+                        "data": notify_data,
+                        "tokens": push_tokens_for_device(),
+                    }
+                )
+            conn.execute(
+                "UPDATE devices SET last_offline = 1, last_offline_notify_ts = ? WHERE device_id = ?",
+                (now, device_id),
+            )
         conn.execute(
             "UPDATE devices SET last_batt_low = ? WHERE device_id = ?",
             (batt_low, device_id),

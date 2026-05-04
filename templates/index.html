@@ -1066,7 +1066,7 @@
 
         function isLikelyLostPower(device) {
             const battery = Number(device?.data?.battery);
-            const lowBattery = Number.isFinite(battery) && battery <= 10;
+            const lowBattery = Number.isFinite(battery) && battery <= 20;
             const forcedLow = device?.force_low_battery === true;
             return forcedLow || (device?.status === "offline" && lowBattery);
         }
