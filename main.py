@@ -739,7 +739,8 @@ def _delete_supabase_tracker_records(device_id: str) -> dict[str, Any]:
     if not client:
         return {"enabled": False, "ok": False, "reason": "missing_service_role_client"}
     try:
-        result = client.table("animal_locations").delete().eq("tracker_id", device_id).execute()
+        result = client.table("animal_locations").delete().eq(
+            "tracker_id", device_id).execute()
         rows = result.data if isinstance(result.data, list) else []
         return {"enabled": True, "ok": True, "deleted_rows": len(rows)}
     except Exception as exc:
@@ -1245,7 +1246,15 @@ def _device_view(
         "age_s": age_s,
         "status": status,
         "data": data,
-        "geofence": _compute_geofence(data, geofence_config),
+        "geofence": (
+            {
+                "out_of_bounds": True,
+                "in_bounds": False,
+                "reason": "forced",
+            }
+            if force_oob
+            else _compute_geofence(data, geofence_config)
+        ),
         "force_oob": force_oob,
         "force_low_battery": force_low_battery,
         "location_frozen": bool(
@@ -1595,75 +1604,69 @@ def shelter_dashboard() -> Any:
 @app.get("/devices")
 @require_web_session_api
 def list_devices():
-    effective_cfg = _effective_server_config_for_request()
-    user = getattr(request, "user", None)
-    user_id = str(getattr(user, "id", "") or "")
-    include_unowned = request.args.get("include_unowned", "0") == "1"
-    with _db() as conn:
-        if include_unowned:
-            rows = conn.execute(
-                """
-                SELECT d.device_id, d.name, d.last_seen, d.force_oob, d.force_low_battery, d.freeze_lat, d.freeze_lng,
-                       r.raw_json AS raw_json
-                FROM devices d
-                LEFT JOIN readings r
-                  ON r.id = (
-                    SELECT id FROM readings
-                    WHERE device_id = d.device_id
-                    ORDER BY ts DESC
-                    LIMIT 1
-                  )
-                WHERE d.shelter_user_id = ? OR d.shelter_user_id IS NULL
-                ORDER BY d.last_seen DESC
-                """,
-                (user_id,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT d.device_id, d.name, d.last_seen, d.force_oob, d.force_low_battery, d.freeze_lat, d.freeze_lng,
-                       r.raw_json AS raw_json
-                FROM devices d
-                LEFT JOIN readings r
-                  ON r.id = (
-                    SELECT id FROM readings
-                    WHERE device_id = d.device_id
-                    ORDER BY ts DESC
-                    LIMIT 1
-                  )
-                WHERE d.shelter_user_id = ?
-                ORDER BY d.last_seen DESC
-                """,
-                (user_id,),
-            ).fetchall()
+    if not supabase_client:
+        return jsonify({"devices": [], "source": "local", "error": "supabase_unavailable"})
 
-    devices_view: list[dict[str, Any]] = []
-    for row in rows:
-        payload: dict[str, Any] = {}
-        if row["raw_json"]:
-            try:
-                parsed = json.loads(row["raw_json"])
-                if isinstance(parsed, dict):
-                    payload = parsed
-            except Exception:
-                payload = {}
-        devices_view.append(
-            _device_view(
-                row["device_id"],
-                {
-                    "last_seen": float(row["last_seen"]),
-                    "data": payload,
-                    "name": row["name"],
-                    "force_oob": int(row["force_oob"] or 0),
-                    "force_low_battery": int(row["force_low_battery"] or 0),
-                    "freeze_lat": row["freeze_lat"],
-                    "freeze_lng": row["freeze_lng"],
-                },
-                effective_cfg,
-            )
+    rows = []
+    try:
+        result = (
+            supabase_client
+            .table("animal_locations")
+            .select("*")
+            .order("recorded_at", desc=True)
+            .limit(100)
+            .execute()
         )
+        rows = result.data or []
+    except Exception as e:
+        return jsonify({"devices": [], "source": "supabase", "error": str(e)}), 500
 
-    return jsonify({"devices": devices_view})
+    latest_by_tracker = {}
+
+    for row in rows:
+        tracker_id = str(row.get("tracker_id") or "").strip()
+        if not tracker_id:
+            continue
+
+        if tracker_id not in latest_by_tracker:
+            latest_by_tracker[tracker_id] = row
+
+    devices_view = []
+
+    for tracker_id, row in latest_by_tracker.items():
+        name = row.get("animal_id") or row.get("name") or tracker_id
+        lat = row.get("latitude")
+        lng = row.get("longitude")
+        battery = row.get("battery")
+        recorded_at = row.get("recorded_at")
+
+        data = {
+            "device_id": tracker_id,
+            "name": name,
+            "battery": battery,
+            "gps": {
+                "lat": lat,
+                "lng": lng,
+            },
+            "gps_source": "supabase",
+        }
+
+        devices_view.append({
+            "device_id": tracker_id,
+            "name": name,
+            "last_seen": recorded_at,
+            "status": row.get("status") or "unknown",
+            "data": data,
+            "geofence": row.get("geofence") or {},
+            "force_oob": False,
+            "force_low_battery": False,
+            "location_frozen": False,
+        })
+
+    return jsonify({
+        "devices": devices_view,
+        "source": "supabase"
+    })
 
 
 @app.get("/config")
@@ -1791,7 +1794,8 @@ def pairing_start():
             INSERT INTO pairing_claims(user_id, expected_name, claim_token, replace_existing, created_at, expires_at)
             VALUES(?, ?, ?, ?, ?, ?)
             """,
-            (user_id, expected_name, claim_token, 1 if replace_existing else 0, now, expires_at),
+            (user_id, expected_name, claim_token,
+             1 if replace_existing else 0, now, expires_at),
         )
     return jsonify(
         {
@@ -1912,7 +1916,8 @@ def receive_data():
                 shelter_user_id = pending_user_id
                 fresh_pairing = True
                 pending_claim_id = int(pending_claim["id"])
-                replace_existing_pairing = bool(pending_claim["replace_existing"])
+                replace_existing_pairing = bool(
+                    pending_claim["replace_existing"])
 
         # Upsert device.
         if row:
@@ -1952,7 +1957,8 @@ def receive_data():
             )
             for conflict in conflicts:
                 conflict_device_id = str(conflict["device_id"])
-                conn.execute("DELETE FROM devices WHERE device_id = ?", (conflict_device_id,))
+                conn.execute(
+                    "DELETE FROM devices WHERE device_id = ?", (conflict_device_id,))
                 replaced_devices.append(conflict_device_id)
 
         def push_tokens_for_device() -> list[str]:
@@ -2048,6 +2054,12 @@ def receive_data():
         # Update last_oob + possibly trigger notification.
         geofence_config = _effective_server_config_for_user(shelter_user_id)
         geofence = _compute_geofence(data, geofence_config)
+
+        if force_oob_bool:
+            geofence["out_of_bounds"] = True
+            geofence["in_bounds"] = False
+            geofence["reason"] = "forced"
+
         heartbeat_geofence = geofence
         out = geofence.get("out_of_bounds")
         out_i = 1 if out is True else 0 if out is False else None
@@ -2071,7 +2083,8 @@ def receive_data():
         else:
             batt_low = None
         heartbeat_effective_battery = effective_battery_i
-        heartbeat_battery_low = bool(batt_low) if batt_low is not None else None
+        heartbeat_battery_low = bool(
+            batt_low) if batt_low is not None else None
         heartbeat_battery_health = (
             None
             if effective_battery_i is None
