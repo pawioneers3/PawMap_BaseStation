@@ -766,6 +766,29 @@ def _delete_supabase_tracker_records(device_id: str) -> dict[str, Any]:
         return {"enabled": True, "ok": False, "reason": str(exc)[:500]}
 
 
+def _rename_local_tracker_records(conn: sqlite3.Connection, device_id: str, name: str) -> None:
+    conn.execute(
+        "UPDATE devices SET name = ? WHERE device_id = ?",
+        (name, device_id),
+    )
+    rows = conn.execute(
+        "SELECT id, raw_json FROM readings WHERE device_id = ?",
+        (device_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(str(row["raw_json"] or "{}"))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        payload["name"] = name
+        conn.execute(
+            "UPDATE readings SET raw_json = ? WHERE id = ?",
+            (json.dumps(payload), row["id"]),
+        )
+
+
 def _rename_supabase_tracker_records(device_id: str, name: str) -> dict[str, Any]:
     client = supabase_admin_client
     if not client:
@@ -797,8 +820,10 @@ def _rename_supabase_tracker_records(device_id: str, name: str) -> dict[str, Any
                 device_id=device_id,
                 name=name,
                 shelter_user_id=_row_owner_user_id(row),
-                force_oob=bool(_row_tracker_meta(row).get("force_oob") or False),
-                force_low_battery=bool(_row_tracker_meta(row).get("force_low_battery") or False),
+                force_oob=bool(_row_tracker_meta(
+                    row).get("force_oob") or False),
+                force_low_battery=bool(_row_tracker_meta(
+                    row).get("force_low_battery") or False),
                 freeze_lat=_row_tracker_meta(row).get("freeze_lat"),
                 freeze_lng=_row_tracker_meta(row).get("freeze_lng"),
             )
@@ -823,7 +848,8 @@ def _rename_supabase_tracker_records(device_id: str, name: str) -> dict[str, Any
             .execute()
         )
         rows = result.data if isinstance(result.data, list) else []
-        notifications_result = _rename_supabase_notification_records(device_id, name)
+        notifications_result = _rename_supabase_notification_records(
+            device_id, name)
         return {
             "enabled": True,
             "ok": True,
@@ -842,7 +868,8 @@ def _rename_supabase_tracker_records(device_id: str, name: str) -> dict[str, Any
                 .execute()
             )
             rows = result.data if isinstance(result.data, list) else []
-            notifications_result = _rename_supabase_notification_records(device_id, name)
+            notifications_result = _rename_supabase_notification_records(
+                device_id, name)
             return {
                 "enabled": True,
                 "ok": True,
@@ -1405,8 +1432,16 @@ def _insert_supabase_control_snapshot(
         effective_battery = forced_value if effective_battery is None else min(
             effective_battery, forced_value)
 
-    battery_low = None if effective_battery is None else _is_low_battery(effective_battery)
+    battery_low = None if effective_battery is None else _is_low_battery(
+        effective_battery)
     battery_health = _battery_health(effective_battery)
+    geofence_out = geofence.get("out_of_bounds")
+    if _is_empty_battery(effective_battery):
+        status = "offline"
+    elif geofence_out is True:
+        status = "out_of_bounds"
+    elif geofence_out is False:
+        status = "in_bounds"
 
     return _send_supabase_tracker_heartbeat(
         device_id=device_id,
@@ -1467,13 +1502,13 @@ def _sync_supabase_tracker_row_to_local(
         "SELECT device_id, first_seen, name FROM devices WHERE device_id = ?",
         (tracker_id,),
     ).fetchone()
+    name = supabase_name or _default_name(tracker_id)
     if existing:
-        local_name = str(existing["name"] or "").strip()
-        name = local_name or supabase_name
         conn.execute(
             """
             UPDATE devices
-            SET shelter_user_id = COALESCE(NULLIF(?, ''), shelter_user_id, ?),
+            SET name = ?,
+                shelter_user_id = COALESCE(NULLIF(?, ''), shelter_user_id, ?),
                 last_seen = MAX(last_seen, ?),
                 force_oob = ?,
                 force_low_battery = ?,
@@ -1482,6 +1517,7 @@ def _sync_supabase_tracker_row_to_local(
             WHERE device_id = ?
             """,
             (
+                name,
                 owner_id,
                 user_id,
                 last_seen_ts,
@@ -1493,7 +1529,6 @@ def _sync_supabase_tracker_row_to_local(
             ),
         )
     else:
-        name = supabase_name
         conn.execute(
             """
             INSERT INTO devices(device_id, name, shelter_user_id, first_seen, last_seen, force_oob, force_low_battery, freeze_lat, freeze_lng)
@@ -2270,18 +2305,18 @@ def list_devices():
             if not entry:
                 continue
 
-            # Prefer the now-synced local control state so buttons reflect changes
-            # made from another base station using the same account.
+            # Supabase is authoritative for tracker identity/name so dashboards
+            # on other logged-in devices see the same value. Local state is only
+            # used for base-station control flags.
             local = conn.execute(
                 """
-                SELECT name, force_oob, force_low_battery, freeze_lat, freeze_lng, last_seen
+                SELECT force_oob, force_low_battery, freeze_lat, freeze_lng, last_seen
                 FROM devices
                 WHERE device_id = ? AND shelter_user_id = ?
                 """,
                 (tracker_id, user_id),
             ).fetchone()
             if local:
-                entry["name"] = str(local["name"] or entry["name"])
                 entry["force_oob"] = bool(local["force_oob"] or 0)
                 entry["force_low_battery"] = bool(
                     local["force_low_battery"] or 0)
@@ -2499,6 +2534,7 @@ def receive_data():
     heartbeat_geofence: Optional[dict[str, Any]] = None
     heartbeat_status: Optional[str] = None
     pending_claim_id: Optional[int] = None
+    expected_claim_name = ""
     replace_existing_pairing = False
     replaced_devices: list[str] = []
     rename_supabase_history = False
@@ -2534,19 +2570,24 @@ def receive_data():
             row["last_offline_notify_ts"] or 0.0) if row else 0.0
         last_recovery_notify_ts = float(
             row["last_recovery_notify_ts"] or 0.0) if row else 0.0
-        # For an already-known tracker, keep the server-side name as the source
-        # of truth. The ESP32 can keep posting an old saved setup name after the
-        # dashboard/Supabase name has changed.
+        # For normal heartbeats, keep the server-side name as the source of
+        # truth. During a valid pairing claim, the claim's expected name is the
+        # new source of truth and overrides the stored name below.
         name = stored_name or incoming_name or _default_name(device_id)
         force_oob_bool = bool(force_oob)
-        rename_supabase_history = bool(
-            stored_name and name and stored_name != name)
+        rename_supabase_history = False
 
         pending_claim = _pending_pairing_claim(
             claim_token=incoming_claim_token,
-            expected_name=name,
+            expected_name="",
             now_ts=now,
         )
+        if not pending_claim and incoming_name and incoming_name != stored_name:
+            pending_claim = _pending_pairing_claim(
+                claim_token="",
+                expected_name=incoming_name,
+                now_ts=now,
+            )
         if pending_claim:
             pending_user_id = str(pending_claim["user_id"])
             if not shelter_user_id or pending_user_id == shelter_user_id:
@@ -2559,8 +2600,7 @@ def receive_data():
                     pending_claim.get("expected_name") or "").strip()
                 if expected_claim_name:
                     name = expected_claim_name
-                    rename_supabase_history = bool(
-                        stored_name and stored_name != name)
+                    rename_supabase_history = True
 
         # Upsert device.
         if row:
@@ -2725,7 +2765,8 @@ def receive_data():
             else:
                 effective_battery_i = min(effective_battery_i, forced_value)
 
-        batt_low = 1 if _is_low_battery(effective_battery_i) else 0 if effective_battery_i is not None else None
+        batt_low = 1 if _is_low_battery(
+            effective_battery_i) else 0 if effective_battery_i is not None else None
         heartbeat_effective_battery = effective_battery_i
         heartbeat_battery_low = bool(
             batt_low) if batt_low is not None else None
@@ -2775,8 +2816,6 @@ def receive_data():
             (batt_low, device_id),
         )
 
-        # Decide whether to notify. OOB/recovery and low battery are independent
-        # alerts because a tracker can be out of bounds and low battery at once.
         if out is True and prev_oob != 1 and (now - (last_notify_ts or 0.0) >= NOTIFY_COOLDOWN_S):
             reason = "forced" if force_oob_bool else str(
                 geofence.get("reason") or "geofence")
@@ -2918,6 +2957,8 @@ def set_device_oob(device_id: str):
     force_low_battery = False
     freeze_lat: Optional[float] = None
     freeze_lng: Optional[float] = None
+
+    rename_supabase_history = False
 
     with _db() as conn:
         row = conn.execute(
@@ -3096,11 +3137,14 @@ def claim_device(device_id: str):
     payload = request.get_json(silent=True)
     reset_history = bool(payload.get("reset_history")) if isinstance(
         payload, dict) else False
+    expected_name = str(payload.get("expected_name") or "").strip() if isinstance(
+        payload, dict) else ""
     user = getattr(request, "user", None)
     user_id = str(getattr(user, "id", "") or "")
     if not user_id:
         return jsonify({"status": "error", "error": "unauthorized"}), 401
 
+    current_name = ""
     with _db() as conn:
         row = conn.execute(
             "SELECT shelter_user_id, name FROM devices WHERE device_id = ?",
@@ -3114,12 +3158,112 @@ def claim_device(device_id: str):
             return jsonify({"status": "error", "error": "owned_by_other_shelter"}), 409
         if reset_history:
             _reset_device_tracking_state(conn, device_id, time.time())
+        current_name = str(row["name"] or "")
+        if expected_name:
+            _rename_local_tracker_records(conn, device_id, expected_name)
+            current_name = expected_name
         conn.execute(
             "UPDATE devices SET shelter_user_id = ? WHERE device_id = ?",
             (user_id, device_id),
         )
 
-    return jsonify({"status": "ok", "device_id": device_id, "shelter_user_id": user_id})
+    supabase_result = (
+        _rename_supabase_tracker_records(device_id, expected_name)
+        if expected_name
+        else {"enabled": False, "ok": False, "reason": "not_needed"}
+    )
+
+    return jsonify({
+        "status": "ok",
+        "device_id": device_id,
+        "name": current_name,
+        "shelter_user_id": user_id,
+        "supabase": supabase_result,
+    })
+
+
+@app.post("/device/<device_id>/rename")
+@require_web_session_api
+def rename_device(device_id: str):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"status": "error", "error": "invalid_json"}), 400
+
+    new_name = str(payload.get("name") or "").strip()
+    if not new_name:
+        return jsonify({"status": "error", "error": "missing_name"}), 400
+
+    user = getattr(request, "user", None)
+    user_id = str(getattr(user, "id", "") or "")
+    if not user_id:
+        return jsonify({"status": "error", "error": "unauthorized"}), 401
+
+    latest = _latest_supabase_tracker_row(device_id)
+    latest_owner_id = _row_owner_user_id(latest) if latest else None
+    if latest_owner_id and latest_owner_id != user_id:
+        return jsonify({"status": "error", "error": "owned_by_other_shelter"}), 409
+
+    now = time.time()
+    force_oob = False
+    force_low_battery = False
+    freeze_lat: Optional[float] = None
+    freeze_lng: Optional[float] = None
+    with _db() as conn:
+        row = conn.execute(
+            """
+            SELECT device_id, name, shelter_user_id, first_seen, last_seen,
+                   force_oob, force_low_battery, freeze_lat, freeze_lng
+            FROM devices
+            WHERE device_id = ?
+            """,
+            (device_id,),
+        ).fetchone()
+        if row:
+            owner_id = str(row["shelter_user_id"] or "").strip()
+            if owner_id and owner_id != user_id and not latest_owner_id:
+                return jsonify({"status": "error", "error": "owned_by_other_shelter"}), 409
+            force_oob = bool(row["force_oob"] or 0)
+            force_low_battery = bool(row["force_low_battery"] or 0)
+            freeze_lat = float(
+                row["freeze_lat"]) if row["freeze_lat"] is not None else None
+            freeze_lng = float(
+                row["freeze_lng"]) if row["freeze_lng"] is not None else None
+            _rename_local_tracker_records(conn, device_id, new_name)
+            conn.execute(
+                """
+                UPDATE devices
+                SET shelter_user_id = COALESCE(NULLIF(shelter_user_id, ''), ?)
+                WHERE device_id = ?
+                """,
+                (user_id, device_id),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO devices(device_id, name, shelter_user_id, first_seen, last_seen)
+                VALUES(?, ?, ?, ?, ?)
+                """,
+                (device_id, new_name, user_id, now, now),
+            )
+
+    supabase_result = _rename_supabase_tracker_records(device_id, new_name)
+    snapshot_result = _insert_supabase_control_snapshot(
+        device_id=device_id,
+        name=new_name,
+        shelter_user_id=user_id,
+        force_oob=force_oob,
+        force_low_battery=force_low_battery,
+        freeze_lat=freeze_lat,
+        freeze_lng=freeze_lng,
+    )
+
+    return jsonify({
+        "status": "ok",
+        "device_id": device_id,
+        "name": new_name,
+        "supabase": supabase_result,
+        "snapshot": snapshot_result,
+    })
 
 
 @app.delete("/device/<device_id>")

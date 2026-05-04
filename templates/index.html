@@ -1184,6 +1184,7 @@ document.getElementById("statOOB").textContent = oob;
                         <td>
                             <div class="actions-row">
                                 <button class="histBtn small" data-id="${d.device_id}" data-name="${(d.name || "").toString().replace(/\"/g, '&quot;')}">History</button>
+                                <button class="renameBtn small" data-id="${d.device_id}" data-name="${(d.name || "").toString().replace(/\"/g, '&quot;')}">Rename</button>
                                 <button class="oobBtn small" data-id="${d.device_id}" data-force="${forced ? "1" : "0"}">${forced ? "Stop Forcing" : "Force OOB"}</button>
                                 <button class="lowBattBtn small" data-id="${d.device_id}" data-force="${forcedLow ? "1" : "0"}">${forcedLow ? "Stop Low Batt" : "Force Low Batt"}</button>
                                 <button class="delBtn small" data-id="${d.device_id}">Remove</button>
@@ -1657,9 +1658,11 @@ document.getElementById("statOOB").textContent = oob;
 
             statusEl.textContent = "Capturing current device list...";
             let known = new Set();
+            let knownDevices = [];
             let claimToken = null;
             try {
                 const before = await fetchDevices(true);
+                knownDevices = before;
                 known = new Set(before.map(d => d.device_id));
             } catch (_) {
                 // If you're currently on the ESP32 AP already, this fetch may fail. That's OK.
@@ -1700,20 +1703,23 @@ document.getElementById("statOOB").textContent = oob;
                     const devices = await fetchDevices(true);
                     renderDevices(devices);
                     const expectedName = (name || "").trim().toLowerCase();
+                    const singleKnownDevice = knownDevices.length === 1 ? knownDevices[0] : null;
                     for (const d of devices) {
                         const deviceNameLc = (d.name || "").toString().trim().toLowerCase();
                         const isNewDevice = !known.has(d.device_id);
                         const isExpectedNameMatch = !!expectedName && deviceNameLc === expectedName;
-                        if (isNewDevice || isExpectedNameMatch) {
+                        const isSingleKnownRepair = singleKnownDevice && d.device_id === singleKnownDevice.device_id;
+                        if (isNewDevice || isExpectedNameMatch || isSingleKnownRepair) {
                             try {
                                 await fetch(`/device/${encodeURIComponent(d.device_id)}/claim`, {
                                     method: "POST",
                                     headers: { "Content-Type": "application/json" },
-                                    body: JSON.stringify({ reset_history: false }),
+                                    body: JSON.stringify({ reset_history: false, expected_name: name }),
                                 });
                             } catch (_) {
                                 // best effort
                             }
+                            d.name = name || d.name;
                             const display = d.name ? `${d.name} (${d.device_id})` : d.device_id;
                             statusEl.textContent = `Paired successfully: ${display}`;
                             setTimeout(closePairing, 800);
@@ -1737,6 +1743,45 @@ document.getElementById("statOOB").textContent = oob;
             const btn = e.target.closest(".histBtn");
             if (!btn) return;
             openHistory(btn.dataset.id, btn.dataset.name);
+        });
+
+        // event delegation for renaming devices
+        document.getElementById("deviceTbody").addEventListener("click", async (e) => {
+            const btn = e.target.closest(".renameBtn");
+            if (!btn) return;
+            const deviceId = btn.dataset.id;
+            const currentName = btn.dataset.name || "";
+            const nextName = prompt("Device name", currentName);
+            if (nextName === null) return;
+            const name = nextName.trim();
+            if (!name || name === currentName) return;
+
+            btn.disabled = true;
+            btn.textContent = "Renaming...";
+            try {
+                const resp = await fetch(`/device/${encodeURIComponent(deviceId)}/rename`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ name }),
+                });
+                const payload = await resp.json().catch(() => ({}));
+                if (!resp.ok) throw new Error(payload?.error || "rename_failed");
+                if (payload?.supabase?.enabled && payload.supabase.ok === false) {
+                    alert(`Name changed locally, but Supabase sync failed: ${payload.supabase.reason || "unknown error"}`);
+                }
+                lastDevices = lastDevices.map(d => {
+                    if (d.device_id !== deviceId) return d;
+                    const data = d.data && typeof d.data === "object" ? { ...d.data, name } : d.data;
+                    return { ...d, name, data };
+                });
+                renderDevices(lastDevices);
+                setTimeout(pollLoop, 1000);
+            } catch (err) {
+                alert(`Rename failed: ${err?.message || "Please try again."}`);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "Rename";
+            }
         });
 
         // event delegation for location/map buttons
