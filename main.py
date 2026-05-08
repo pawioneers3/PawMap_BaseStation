@@ -820,6 +820,7 @@ def _rename_supabase_tracker_records(device_id: str, name: str) -> dict[str, Any
                 device_id=device_id,
                 name=name,
                 shelter_user_id=_row_owner_user_id(row),
+                gps_source=str(_row_tracker_meta(row).get("gps_source") or ""),
                 force_oob=bool(_row_tracker_meta(
                     row).get("force_oob") or False),
                 force_low_battery=bool(_row_tracker_meta(
@@ -1026,6 +1027,7 @@ def _geofence_with_tracker_meta(
     device_id: str,
     name: str,
     shelter_user_id: Optional[str],
+    gps_source: Optional[str],
     force_oob: bool,
     force_low_battery: bool,
     freeze_lat: Optional[float] = None,
@@ -1038,6 +1040,7 @@ def _geofence_with_tracker_meta(
             "device_id": device_id,
             "name": name,
             "shelter_user_id": shelter_user_id or "",
+            "gps_source": gps_source or "",
             "force_oob": bool(force_oob),
             "force_low_battery": bool(force_low_battery),
             "freeze_lat": freeze_lat,
@@ -1137,6 +1140,7 @@ def _tracker_location_payload(
     battery_health: Optional[str],
     battery_low: Optional[bool],
     geofence: Optional[dict[str, Any]],
+    gps_source: Optional[str],
     status: Optional[str],
     recorded_ts: float,
     force_oob: bool = False,
@@ -1151,6 +1155,7 @@ def _tracker_location_payload(
         device_id=device_id,
         name=name,
         shelter_user_id=shelter_user_id,
+        gps_source=gps_source,
         force_oob=force_oob,
         force_low_battery=force_low_battery,
         freeze_lat=freeze_lat,
@@ -1161,6 +1166,7 @@ def _tracker_location_payload(
         "name": name,
         "shelter_user_id": shelter_user_id,
         "gps": {"lat": lat, "lng": lng},
+        "gps_source": gps_source or "",
         "battery": battery,
         "effective_battery": effective_battery,
         "battery_health": battery_health,
@@ -1275,6 +1281,7 @@ def _send_supabase_tracker_heartbeat(
     battery_health: Optional[str],
     battery_low: Optional[bool],
     geofence: Optional[dict[str, Any]],
+    gps_source: Optional[str],
     status: Optional[str],
     recorded_ts: float,
     force_oob: bool = False,
@@ -1296,6 +1303,7 @@ def _send_supabase_tracker_heartbeat(
         battery_health=battery_health,
         battery_low=battery_low,
         geofence=geofence,
+        gps_source=gps_source,
         status=status,
         recorded_ts=recorded_ts,
         force_oob=force_oob,
@@ -1378,6 +1386,7 @@ def _insert_supabase_control_snapshot(
     battery: Optional[int] = None
     status = "unknown"
     geofence: dict[str, Any] = {}
+    gps_source = "supabase"
 
     latest = _latest_supabase_tracker_row(device_id)
     if latest:
@@ -1401,6 +1410,7 @@ def _insert_supabase_control_snapshot(
             battery = None
         status = str(latest.get("status") or status)
         geofence = _row_geofence(latest)
+        gps_source = str(_row_tracker_meta(latest).get("gps_source") or gps_source)
 
     if lat is None or lng is None:
         with _db() as conn:
@@ -1454,6 +1464,7 @@ def _insert_supabase_control_snapshot(
         battery_health=battery_health,
         battery_low=battery_low,
         geofence=geofence,
+        gps_source=gps_source,
         status=status,
         recorded_ts=now_ts,
         force_oob=force_oob,
@@ -1487,6 +1498,7 @@ def _sync_supabase_tracker_row_to_local(
     force_low_battery = bool(
         row.get("force_low_battery") or meta.get("force_low_battery") or False
     )
+    gps_source = str(meta.get("gps_source") or "supabase")
     freeze_lat = meta.get("freeze_lat")
     freeze_lng = meta.get("freeze_lng")
     try:
@@ -1572,7 +1584,7 @@ def _sync_supabase_tracker_row_to_local(
         "battery_health": row.get("battery_health"),
         "status": row.get("status"),
         "gps": {"lat": lat_f, "lng": lng_f},
-        "gps_source": "supabase",
+        "gps_source": gps_source,
         "geofence": _row_geofence(row),
     }
     duplicate = conn.execute(
@@ -2692,6 +2704,7 @@ def receive_data():
             )
 
         gps = data.get("gps") if isinstance(data.get("gps"), dict) else {}
+        gps_source_s = str(data.get("gps_source") or "").strip()
         if force_low_battery and freeze_lat is not None and freeze_lng is not None:
             gps = {"lat": freeze_lat, "lng": freeze_lng}
             data["gps"] = gps
@@ -2904,6 +2917,7 @@ def receive_data():
         battery_health=heartbeat_battery_health,
         battery_low=heartbeat_battery_low,
         geofence=heartbeat_geofence,
+        gps_source=gps_source_s,
         status=heartbeat_status,
         recorded_ts=now,
         force_oob=bool(force_oob),
@@ -3558,7 +3572,7 @@ def history(device_id: str):
                             "name": name,
                             "battery": battery,
                             "gps": {"lat": lat, "lng": lng},
-                            "gps_source": "supabase",
+                            "gps_source": str(_row_tracker_meta(row).get("gps_source") or "supabase"),
                             "geofence": _row_geofence(row),
                         },
                     }
