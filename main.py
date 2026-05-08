@@ -2515,7 +2515,6 @@ def receive_data():
     if not device_id:
         return jsonify({"status": "error", "error": "missing_device_id"}), 400
 
-    # Backward compatible: name/gps/battery may be missing.
     incoming_name = str(data.get("name") or "").strip()
     incoming_claim_token = str(data.get("claim_token") or "").strip()
 
