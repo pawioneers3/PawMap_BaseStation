@@ -1045,19 +1045,24 @@
                 { lat: bbox.minLat, lng: bbox.minLng },
                 { lat: bbox.maxLat, lng: bbox.maxLng }
             );
-            return clamp(diagonal * 8, 500, 5000);
+            return clamp(diagonal * 20, 1000, 20000);
         }
 
         function recentContinuousTrail(points, bbox) {
             const limit = mapTrailLimit();
             const jumpLimit = mapJumpLimitMeters(bbox);
             const kept = [];
+            let skippedJumps = 0;
             for (let i = points.length - 1; i >= 0 && kept.length < limit; i--) {
                 const current = points[i];
                 if (!current?.gps) continue;
                 if (kept.length) {
                     const previous = kept[kept.length - 1];
-                    if (distanceMeters(current.gps, previous.gps) > jumpLimit) break;
+                    if (distanceMeters(current.gps, previous.gps) > jumpLimit) {
+                        skippedJumps += 1;
+                        if (skippedJumps > 5) break;
+                        continue;
+                    }
                 }
                 kept.push(current);
             }
