@@ -56,7 +56,6 @@ DB_PATH = BASE_DIR / "basestation.db"
 NOTIFY_COOLDOWN_S = 30
 BATTERY_LOW_THRESHOLD = 20
 BATTERY_EMPTY_THRESHOLD = 0
-OFFLINE_TIMEOUT_S = 90
 OFFLINE_MONITOR_INTERVAL_S = 15
 
 
@@ -107,6 +106,14 @@ def _coerce_int(v: Any, default: int) -> int:
 
 def _is_low_battery(value: Optional[int]) -> bool:
     return value is not None and value <= BATTERY_LOW_THRESHOLD
+
+
+def _offline_timeout_s(cfg: Optional[dict[str, Any]] = None) -> int:
+    active_cfg = cfg or server_config
+    post_interval_min = _coerce_int(active_cfg.get("post_interval_min"), 1)
+    if post_interval_min not in (1, 5, 15, 30):
+        post_interval_min = 1
+    return int((post_interval_min + 5) * 60)
 
 
 def _is_empty_battery(value: Optional[int]) -> bool:
@@ -724,6 +731,7 @@ def _pairing_name_conflicts(
     expected_name: str,
     exclude_device_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
+    timeout_s = _offline_timeout_s()
     params: list[Any] = [user_id, expected_name]
     sql = """
         SELECT device_id, name, last_seen
@@ -741,7 +749,7 @@ def _pairing_name_conflicts(
     for row in rows:
         last_seen = float(row["last_seen"] or 0.0)
         age_s = max(0.0, now_ts - last_seen) if last_seen else None
-        status = "online" if last_seen and age_s is not None and age_s <= OFFLINE_TIMEOUT_S else "offline"
+        status = "online" if last_seen and age_s is not None and age_s <= timeout_s else "offline"
         conflicts.append(
             {
                 "device_id": str(row["device_id"]),
@@ -1713,7 +1721,7 @@ def _retry_failed_notifications(limit: int = 50) -> dict[str, int]:
 
 def _scan_and_notify_offline_devices(now: Optional[float] = None) -> int:
     now_ts = time.time() if now is None else now
-    offline_before = now_ts - OFFLINE_TIMEOUT_S
+    offline_before = now_ts - _offline_timeout_s()
     pending: list[dict[str, Any]] = []
 
     with _db() as conn:
@@ -1865,6 +1873,7 @@ def _device_view(
     geofence_config: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     active_cfg = geofence_config or server_config
+    timeout_s = _offline_timeout_s(active_cfg)
 
     last_seen = float(entry.get("last_seen", 0.0))
     data = entry.get("data") or {}
@@ -1877,7 +1886,7 @@ def _device_view(
 
     age_s = max(0.0, time.time() - last_seen) if last_seen else None
 
-    if last_seen and age_s is not None and age_s <= OFFLINE_TIMEOUT_S:
+    if last_seen and age_s is not None and age_s <= timeout_s:
         status = "online"
     else:
         status = "offline"

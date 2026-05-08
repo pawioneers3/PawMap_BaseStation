@@ -704,6 +704,13 @@ static void maybePostData() {
   if (respBody.length()) {
     applyConfigFromServer(respBody);
   }
+
+  Serial.printf("[GPS] source=%s lat=%.6f lng=%.6f battery=%d%% post=%lu\n",
+                useRealGps ? "a9g" : "mock",
+                gpsLat,
+                gpsLng,
+                batteryPct,
+                postCounter);
 }
 
 static void maybeClearConfigOnBoot() {
