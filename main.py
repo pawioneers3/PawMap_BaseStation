@@ -2714,9 +2714,6 @@ def receive_data():
 
         gps = data.get("gps") if isinstance(data.get("gps"), dict) else {}
         gps_source_s = str(data.get("gps_source") or "").strip()
-        if force_low_battery and freeze_lat is not None and freeze_lng is not None:
-            gps = {"lat": freeze_lat, "lng": freeze_lng}
-            data["gps"] = gps
         lat = gps.get("lat")
         lng = gps.get("lng")
         try:
@@ -2728,8 +2725,12 @@ def receive_data():
         except Exception:
             lng_f = None
 
-        # Safety: if force-low is on but freeze point wasn't set yet, lock to first seen point.
+        # Keep a reference point for "last known location" UI metadata, but do
+        # not replace incoming GPS. The tracker can still report live movement
+        # while the demo low-battery flag is enabled.
         if force_low_battery and freeze_lat is None and freeze_lng is None and lat_f is not None and lng_f is not None:
+            freeze_lat = lat_f
+            freeze_lng = lng_f
             conn.execute(
                 "UPDATE devices SET freeze_lat = ?, freeze_lng = ? WHERE device_id = ?",
                 (lat_f, lng_f, device_id),
@@ -3589,8 +3590,17 @@ def history(device_id: str):
         except Exception:
             supabase_points = []
 
-    if len(supabase_points) > len(points):
-        points = supabase_points
+    if supabase_points:
+        merged_by_ts: dict[int, dict[str, Any]] = {}
+        # Supabase can contain more historical rows, while local SQLite can
+        # have the freshest heartbeat if the cloud sync is delayed. Merge both
+        # feeds and prefer local rows for near-identical timestamps.
+        for point in supabase_points:
+            merged_by_ts[int(float(point["ts"]) * 1000)] = point
+        for point in points:
+            merged_by_ts[int(float(point["ts"]) * 1000)] = point
+        points = sorted(merged_by_ts.values(), key=lambda p: float(p["ts"]))
+        points = points[-limit_i:]
         if points:
             drow = {
                 "device_id": device_id,
