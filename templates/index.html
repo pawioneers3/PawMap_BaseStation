@@ -998,6 +998,19 @@
             return { key: "unknown", label: "GPS: unknown", className: "info", detail: "No gps_source flag from device payload" };
         }
 
+        function renderGpsDebug(device) {
+            const debug = device?.data?.gps_debug;
+            if (!debug || typeof debug !== "object") return "";
+            const lock = debug.lock_ok === true ? "lock: yes" : "lock: no";
+            const csq = Number(debug.csq_rssi);
+            const csqTxt = Number.isFinite(csq) && csq >= 0 ? `CSQ: ${csq}` : "CSQ: -";
+            const baud = Number(debug.a9g_baud);
+            const baudTxt = Number.isFinite(baud) && baud > 0 ? `baud: ${baud}` : "baud: -";
+            const reason = (debug.reason || device?.data?.gps_wait_reason || "").toString().trim();
+            const reasonLine = reason ? `<div class="muted" style="font-size:11px;">reason: ${reason}</div>` : "";
+            return `<div class="muted" style="font-size:11px; margin-top:6px;">${lock} · ${csqTxt} · ${baudTxt}</div>${reasonLine}`;
+        }
+
         function clamp(v, lo, hi) {
             return Math.max(lo, Math.min(hi, v));
         }
@@ -1187,6 +1200,7 @@ document.getElementById("statOOB").textContent = oob;
                             <div style="margin-top:8px;">
                                 <span class="pill ${gpsSource.className}" title="${gpsSource.detail}">${gpsSource.label}</span>
                             </div>
+                            ${renderGpsDebug(d)}
                             <div style="margin-top:8px;">
                                 <button class="mapBtn small subtle ${isLikelyLostPower(d) ? "alert" : ""}"
                                     data-id="${d.device_id}"

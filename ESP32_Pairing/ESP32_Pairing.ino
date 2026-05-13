@@ -83,6 +83,10 @@ unsigned long lastGpsProbeMs = 0;
 unsigned long lastGpsStatusPostMs = 0;
 unsigned long gpsWaitAttempts = 0;
 String gpsWaitReason = "";
+bool lastGpsLockOk = false;
+int lastGpsSignalRssi = -1;
+int lastGpsSignalBer = -1;
+unsigned long lastGpsSignalCheckMs = 0;
 
 unsigned long resetHoldStartMs = 0;
 
@@ -514,6 +518,39 @@ static bool parseA9GLocation(const String &resp, float &lat, float &lng) {
   return !(isnan(lat) || isnan(lng));
 }
 
+static bool parseA9GCsq(const String &resp, int &rssi, int &ber) {
+  int marker = resp.indexOf("+CSQ:");
+  if (marker < 0) return false;
+  int lineEnd = resp.indexOf('\n', marker);
+  String line = lineEnd >= 0 ? resp.substring(marker, lineEnd) : resp.substring(marker);
+  int colon = line.indexOf(':');
+  if (colon < 0) return false;
+  String values = line.substring(colon + 1);
+  values.trim();
+  int comma = values.indexOf(',');
+  if (comma < 0) return false;
+  String rssiStr = values.substring(0, comma);
+  String berStr = values.substring(comma + 1);
+  rssiStr.trim();
+  berStr.trim();
+  rssi = rssiStr.toInt();
+  ber = berStr.toInt();
+  return true;
+}
+
+static void maybeRefreshA9GSignal(bool forceNow = false) {
+  unsigned long now = millis();
+  if (!forceNow && (now - lastGpsSignalCheckMs < 30000)) return;
+  lastGpsSignalCheckMs = now;
+  if (a9gActiveBaud <= 0) return;
+  int rssi = -1, ber = -1;
+  String resp = a9gSendCommand("AT+CSQ", 900);
+  if (parseA9GCsq(resp, rssi, ber)) {
+    lastGpsSignalRssi = rssi;
+    lastGpsSignalBer = ber;
+  }
+}
+
 static bool fetchA9GGps(float &lat, float &lng) {
   String resp = a9gSendCommand("AT+LOCATION=2", GPS_CMD_TIMEOUT_MS);
   return parseA9GLocation(resp, lat, lng);
@@ -649,6 +686,12 @@ static void postGpsWaitStatus(bool waiting, const String &reason) {
   doc["gps_wait_reason"] = reason;
   doc["gps_wait_attempts"] = (unsigned long)gpsWaitAttempts;
   doc["gps_source"] = useRealGps ? "a9g" : "mock";
+  JsonObject dbg = doc.createNestedObject("gps_debug");
+  dbg["lock_ok"] = useRealGps;
+  dbg["a9g_detected"] = (a9gActiveBaud > 0);
+  dbg["a9g_baud"] = a9gActiveBaud;
+  dbg["csq_rssi"] = lastGpsSignalRssi;
+  dbg["csq_ber"] = lastGpsSignalBer;
 
   String payload;
   serializeJson(doc, payload);
@@ -692,13 +735,16 @@ static bool maybeHandleForcedGpsLockWait() {
 
     if (!a9gReady) {
       gpsWaitReason = "a9g_not_detected";
+      lastGpsLockOk = false;
     } else {
       float lat = 0.0f, lng = 0.0f;
+      maybeRefreshA9GSignal(true);
       if (fetchA9GGps(lat, lng)) {
         useRealGps = true;
         gpsLat = lat;
         gpsLng = lng;
         gpsInited = true;
+        lastGpsLockOk = true;
         gpsWaitReason = "";
         Serial.printf("[GPS] Lock acquired in forced-wait mode: %.6f, %.6f\n", gpsLat, gpsLng);
         postGpsWaitStatus(false, "locked");
@@ -706,6 +752,7 @@ static bool maybeHandleForcedGpsLockWait() {
         return false;
       }
       gpsWaitReason = "gps_not_fixed";
+      lastGpsLockOk = false;
     }
     Serial.printf("[GPS] Waiting for lock (%s), attempts=%lu\n", gpsWaitReason.c_str(), gpsWaitAttempts);
   }
@@ -731,10 +778,13 @@ static void maybePostData() {
   if (useRealGps) {
     if (checkGpsNow) {
       float lat = 0.0f, lng = 0.0f;
+      maybeRefreshA9GSignal();
       if (fetchA9GGps(lat, lng)) {
         gpsLat = lat;
         gpsLng = lng;
+        lastGpsLockOk = true;
       } else {
+        lastGpsLockOk = false;
         Serial.println("[GPS] Real GPS read failed. Keeping last known coordinate.");
       }
     }
@@ -742,13 +792,17 @@ static void maybePostData() {
     bool promotedToReal = false;
     if (checkGpsNow) {
       float lat = 0.0f, lng = 0.0f;
+      maybeRefreshA9GSignal();
       if (fetchA9GGps(lat, lng)) {
         useRealGps = true;
         gpsLat = lat;
         gpsLng = lng;
         gpsInited = true;
+        lastGpsLockOk = true;
         promotedToReal = true;
         Serial.printf("[GPS] Runtime lock acquired: %.6f, %.6f (switching to real GPS)\n", gpsLat, gpsLng);
+      } else {
+        lastGpsLockOk = false;
       }
     }
     if (!promotedToReal) {
@@ -768,6 +822,14 @@ static void maybePostData() {
   gps["lat"] = gpsLat;
   gps["lng"] = gpsLng;
   doc["gps_source"] = useRealGps ? "a9g" : "mock";
+  JsonObject gpsDebug = doc.createNestedObject("gps_debug");
+  gpsDebug["lock_ok"] = useRealGps && lastGpsLockOk;
+  gpsDebug["a9g_detected"] = (a9gActiveBaud > 0);
+  gpsDebug["a9g_baud"] = a9gActiveBaud;
+  gpsDebug["csq_rssi"] = lastGpsSignalRssi;
+  gpsDebug["csq_ber"] = lastGpsSignalBer;
+  gpsDebug["wait_for_lock_enabled"] = forceWaitForGpsLock;
+  if (!useRealGps && gpsWaitReason.length()) gpsDebug["reason"] = gpsWaitReason;
   doc["battery"] = batteryPct;
 
   String payload;

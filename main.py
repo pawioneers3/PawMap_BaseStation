@@ -164,7 +164,8 @@ def _init_db() -> None:
                 gps_waiting INTEGER NOT NULL DEFAULT 0,
                 gps_wait_reason TEXT,
                 gps_wait_attempts INTEGER NOT NULL DEFAULT 0,
-                gps_wait_updated_at REAL
+                gps_wait_updated_at REAL,
+                gps_debug_json TEXT
             )
             """
         )
@@ -340,6 +341,10 @@ def _init_db() -> None:
             pass
         try:
             conn.execute("ALTER TABLE devices ADD COLUMN gps_wait_updated_at REAL")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE devices ADD COLUMN gps_debug_json TEXT")
         except sqlite3.OperationalError:
             pass
 
@@ -2356,6 +2361,7 @@ def list_devices():
                 """
                 SELECT force_oob, force_low_battery, freeze_lat, freeze_lng, last_seen,
                        gps_waiting, gps_wait_reason, gps_wait_attempts, gps_wait_updated_at
+                       ,gps_debug_json
                 FROM devices
                 WHERE device_id = ? AND shelter_user_id = ?
                 """,
@@ -2374,6 +2380,13 @@ def list_devices():
                 entry_data["gps_wait_reason"] = str(local["gps_wait_reason"] or "")
                 entry_data["gps_wait_attempts"] = int(local["gps_wait_attempts"] or 0)
                 entry_data["gps_wait_updated_at"] = float(local["gps_wait_updated_at"] or 0.0)
+                if local["gps_debug_json"]:
+                    try:
+                        gps_debug = json.loads(str(local["gps_debug_json"]))
+                        if isinstance(gps_debug, dict):
+                            entry_data["gps_debug"] = gps_debug
+                    except Exception:
+                        pass
                 entry["data"] = entry_data
 
             devices_view.append(_device_view(tracker_id, entry, effective_cfg))
@@ -2591,6 +2604,7 @@ def receive_data():
     replace_existing_pairing = False
     replaced_devices: list[str] = []
     rename_supabase_history = False
+    gps_debug_json_text: Optional[str] = None
     with _db() as conn:
         row = conn.execute(
             """
@@ -2749,6 +2763,12 @@ def receive_data():
 
         gps = data.get("gps") if isinstance(data.get("gps"), dict) else {}
         gps_source_s = str(data.get("gps_source") or "").strip()
+        gps_debug_payload = data.get("gps_debug")
+        if isinstance(gps_debug_payload, dict):
+            try:
+                gps_debug_json_text = json.dumps(gps_debug_payload)
+            except Exception:
+                gps_debug_json_text = None
         lat = gps.get("lat")
         lng = gps.get("lng")
         try:
@@ -2794,6 +2814,11 @@ def receive_data():
             """,
             (device_id, now, status_s, battery_i, lat_f, lng_f, json.dumps(data)),
         )
+        if gps_debug_json_text is not None:
+            conn.execute(
+                "UPDATE devices SET gps_debug_json = ? WHERE device_id = ?",
+                (gps_debug_json_text, device_id),
+            )
 
         # Update last_oob + possibly trigger notification.
         geofence_config = _effective_server_config_for_user(shelter_user_id)
@@ -3014,6 +3039,13 @@ def receive_gps_status():
     gps_waiting = bool(payload.get("gps_waiting", True))
     gps_wait_reason = str(payload.get("gps_wait_reason") or "").strip()
     gps_wait_attempts = max(0, _coerce_int(payload.get("gps_wait_attempts"), 0))
+    gps_debug_payload = payload.get("gps_debug")
+    gps_debug_json_text: Optional[str] = None
+    if isinstance(gps_debug_payload, dict):
+        try:
+            gps_debug_json_text = json.dumps(gps_debug_payload)
+        except Exception:
+            gps_debug_json_text = None
     now = time.time()
     shelter_user_id: Optional[str] = None
 
@@ -3032,10 +3064,11 @@ def receive_gps_status():
                 gps_waiting = ?,
                 gps_wait_reason = ?,
                 gps_wait_attempts = ?,
-                gps_wait_updated_at = ?
+                gps_wait_updated_at = ?,
+                gps_debug_json = COALESCE(?, gps_debug_json)
             WHERE device_id = ?
             """,
-            (now, 1 if gps_waiting else 0, gps_wait_reason, gps_wait_attempts, now, device_id),
+            (now, 1 if gps_waiting else 0, gps_wait_reason, gps_wait_attempts, now, gps_debug_json_text, device_id),
         )
 
     return jsonify({"status": "ok", "config": _effective_server_config_for_user(shelter_user_id)})
