@@ -17,6 +17,8 @@ static const int A9G_TX_PIN = 17; // ESP32 TX2 pin (writes to A9G RX)
 static const unsigned long GPS_BOOT_LOCK_TIMEOUT_MS = 12000;
 static const unsigned long GPS_BOOT_POLL_INTERVAL_MS = 1500;
 static const unsigned long GPS_CMD_TIMEOUT_MS = 1500;
+static const unsigned long GPS_LOCK_RETRY_INTERVAL_MS = 15000;
+static const unsigned long GPS_WAIT_STATUS_INTERVAL_MS = 10000;
 
 const long A9G_BAUD_CANDIDATES[] = {115200, 9600, 57600, 38400, 19200};
 const size_t A9G_BAUD_COUNT = sizeof(A9G_BAUD_CANDIDATES) / sizeof(A9G_BAUD_CANDIDATES[0]);
@@ -76,6 +78,11 @@ int batteryPct = 100;
 bool batteryInited = false;
 bool useRealGps = false;
 long a9gActiveBaud = 0;
+bool forceWaitForGpsLock = false;
+unsigned long lastGpsProbeMs = 0;
+unsigned long lastGpsStatusPostMs = 0;
+unsigned long gpsWaitAttempts = 0;
+String gpsWaitReason = "";
 
 unsigned long resetHoldStartMs = 0;
 
@@ -617,10 +624,97 @@ static void applyConfigFromServer(const String &responseBody) {
       gpsCheckEveryNPosts = n;
     }
   }
+  if (cfgObj.containsKey("force_wait_for_gps_lock")) {
+    bool newForceWait = (bool)cfgObj["force_wait_for_gps_lock"];
+    if (newForceWait != forceWaitForGpsLock) {
+      gpsWaitAttempts = 0;
+      lastGpsProbeMs = 0;
+      lastGpsStatusPostMs = 0;
+      gpsWaitReason = "";
+    }
+    forceWaitForGpsLock = newForceWait;
+  }
 
   gpsInited = false; // re-seed after any GPS config change
-  Serial.printf("[CFG] post_interval_min=%lu gps_check_every_n_posts=%d\n",
-                postIntervalMs / 60000UL, gpsCheckEveryNPosts);
+  Serial.printf("[CFG] post_interval_min=%lu gps_check_every_n_posts=%d force_wait_for_gps_lock=%s\n",
+                postIntervalMs / 60000UL, gpsCheckEveryNPosts, forceWaitForGpsLock ? "true" : "false");
+}
+
+static void postGpsWaitStatus(bool waiting, const String &reason) {
+  String url = String("http://") + cfg.serverIp + ":5000/gps_status";
+  StaticJsonDocument<320> doc;
+  doc["device_id"] = deviceId;
+  doc["name"] = cfg.name.length() ? cfg.name : defaultNameFor(deviceId);
+  doc["gps_waiting"] = waiting;
+  doc["gps_wait_reason"] = reason;
+  doc["gps_wait_attempts"] = (unsigned long)gpsWaitAttempts;
+  doc["gps_source"] = useRealGps ? "a9g" : "mock";
+
+  String payload;
+  serializeJson(doc, payload);
+
+  HTTPClient http;
+  http.setTimeout(2500);
+  if (!http.begin(url)) {
+    Serial.println("[GPS] /gps_status begin failed");
+    return;
+  }
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST((uint8_t *)payload.c_str(), payload.length());
+  String respBody = "";
+  if (code > 0) respBody = http.getString();
+  http.end();
+  if (code > 0 && respBody.length()) applyConfigFromServer(respBody);
+  Serial.printf("[GPS] POST /gps_status -> %d waiting=%s reason=%s attempts=%lu\n",
+                code, waiting ? "true" : "false", reason.c_str(), gpsWaitAttempts);
+}
+
+static bool maybeHandleForcedGpsLockWait() {
+  if (mode != MODE_NORMAL) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (!forceWaitForGpsLock || useRealGps) return false;
+
+  unsigned long now = millis();
+  bool shouldProbe = (lastGpsProbeMs == 0 || (now - lastGpsProbeMs >= GPS_LOCK_RETRY_INTERVAL_MS));
+  if (shouldProbe) {
+    lastGpsProbeMs = now;
+    gpsWaitAttempts++;
+
+    bool a9gReady = (a9gActiveBaud > 0);
+    if (!a9gReady) {
+      a9gReady = detectA9GBaud();
+      if (a9gReady) {
+        Serial.printf("[GPS] A9G detected at baud %ld during runtime wait\n", a9gActiveBaud);
+        a9gSendCommand("ATE0", 600);
+        a9gSendCommand("AT+GPS=1", 1200);
+      }
+    }
+
+    if (!a9gReady) {
+      gpsWaitReason = "a9g_not_detected";
+    } else {
+      float lat = 0.0f, lng = 0.0f;
+      if (fetchA9GGps(lat, lng)) {
+        useRealGps = true;
+        gpsLat = lat;
+        gpsLng = lng;
+        gpsInited = true;
+        gpsWaitReason = "";
+        Serial.printf("[GPS] Lock acquired in forced-wait mode: %.6f, %.6f\n", gpsLat, gpsLng);
+        postGpsWaitStatus(false, "locked");
+        lastPostMs = 0;
+        return false;
+      }
+      gpsWaitReason = "gps_not_fixed";
+    }
+    Serial.printf("[GPS] Waiting for lock (%s), attempts=%lu\n", gpsWaitReason.c_str(), gpsWaitAttempts);
+  }
+
+  if (lastGpsStatusPostMs == 0 || (now - lastGpsStatusPostMs >= GPS_WAIT_STATUS_INTERVAL_MS)) {
+    lastGpsStatusPostMs = now;
+    postGpsWaitStatus(true, gpsWaitReason.length() ? gpsWaitReason : "waiting_for_lock");
+  }
+  return true;
 }
 
 static void maybePostData() {
@@ -697,6 +791,7 @@ static void maybePostData() {
   if (code > 0) {
     Serial.printf("[NORMAL] POST /data -> %d (interval=%lums gps_check_every=%d)\n",
                   code, postIntervalMs, gpsCheckEveryNPosts);
+    gpsWaitReason = "";
   } else {
     Serial.printf("[NORMAL] POST /data failed: %d\n", code);
   }
@@ -781,6 +876,10 @@ void loop() {
 
   ensureWifiConnected();
   ensureMdns();
+  if (maybeHandleForcedGpsLockWait()) {
+    delay(5);
+    return;
+  }
   maybePostData();
   delay(5);
 }

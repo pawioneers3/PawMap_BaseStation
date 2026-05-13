@@ -766,6 +766,13 @@
     <span>Loop battery simulation (0–100%)</span>
 </label>
                     </div>
+                    <div class="control-field">
+                        <label class="checkbox-row">
+    <input type="checkbox" id="cfgForceWaitGpsLock" />
+    <span>Force GPS lock before full data posting</span>
+</label>
+                        <div class="subtitle">If enabled, tracker sends GPS lock status updates first, then resumes normal `/data` after lock.</div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -1139,6 +1146,9 @@ document.getElementById("statOOB").textContent = oob;
                 const battery = d.data ? d.data.battery : undefined;
                 const gps = d.data ? d.data.gps : undefined;
                 const gpsSource = gpsSourceInfo(d);
+                const gpsWaiting = d.data?.gps_waiting === true;
+                const gpsWaitReason = (d.data?.gps_wait_reason || "").toString();
+                const gpsWaitAttempts = Number(d.data?.gps_wait_attempts || 0);
                 const gf = d.geofence || {};
                 const out = gf.out_of_bounds === true;
                 const forced = d.force_oob === true;
@@ -1149,6 +1159,9 @@ document.getElementById("statOOB").textContent = oob;
                         : `<span class="pill online">in bounds</span>`;
                 const demoPill = forced ? `<span class="pill info">demo: force OOB</span>` : ``;
                 const demoBattPill = forcedLow ? `<span class="pill info">demo: force low battery</span>` : ``;
+                const gpsWaitPill = gpsWaiting
+                    ? `<span class="pill warn" title="${gpsWaitReason || "waiting for satellite lock"}">gps waiting${gpsWaitAttempts > 0 ? ` (${gpsWaitAttempts})` : ""}</span>`
+                    : ``;
                 return `
                     <tr>
                         <td>
@@ -1161,6 +1174,7 @@ document.getElementById("statOOB").textContent = oob;
                                 ${fencePill}
                                 ${demoPill}
                                 ${demoBattPill}
+                                ${gpsWaitPill}
                             </div>
                         </td>
                         <td>
@@ -1551,6 +1565,7 @@ document.getElementById("statOOB").textContent = oob;
                 document.getElementById("cfgPostIntervalMin").value = [1, 5, 15, 30].includes(postIntervalMin) ? String(postIntervalMin) : "1";
                 const gpsCheckEvery = Number(cfg.gps_check_every_n_posts ?? 1);
                 document.getElementById("cfgGpsCheckEvery").value = [1, 2, 5].includes(gpsCheckEvery) ? String(gpsCheckEvery) : "1";
+                document.getElementById("cfgForceWaitGpsLock").checked = !!cfg.force_wait_for_gps_lock;
                 document.getElementById("cfgStatus").textContent = "";
                 if (lastDevices.length) renderDevices(lastDevices);
             } catch (_) {
@@ -1570,6 +1585,7 @@ document.getElementById("statOOB").textContent = oob;
             const loop = document.getElementById("cfgBatteryLoop").checked;
             const postIntervalMin = Number(document.getElementById("cfgPostIntervalMin").value);
             const gpsCheckEvery = Number(document.getElementById("cfgGpsCheckEvery").value);
+            const forceWaitGpsLock = document.getElementById("cfgForceWaitGpsLock").checked;
             const bboxLocked = (currentConfig?.gps_bbox_source || "manual") === "shelter_boundary";
 
             if (!bboxLocked && (!Number.isFinite(minLat) || !Number.isFinite(maxLat) || !Number.isFinite(minLng) || !Number.isFinite(maxLng))) {
@@ -1603,6 +1619,7 @@ document.getElementById("statOOB").textContent = oob;
                             battery_loop: loop,
                             post_interval_min: postIntervalMin,
                             gps_check_every_n_posts: gpsCheckEvery,
+                            force_wait_for_gps_lock: forceWaitGpsLock,
                         }
                     })
                 });

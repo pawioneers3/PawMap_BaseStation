@@ -74,6 +74,7 @@ server_config: dict[str, Any] = {
     "battery_loop": True,
     "post_interval_min": 1,  # 1 | 5 | 15 | 30
     "gps_check_every_n_posts": 1,  # 1 | 2 | 5
+    "force_wait_for_gps_lock": False,
 }
 
 
@@ -159,7 +160,11 @@ def _init_db() -> None:
                 last_batt_notify_ts REAL NOT NULL DEFAULT 0,
                 last_offline INTEGER NOT NULL DEFAULT 0,
                 last_offline_notify_ts REAL NOT NULL DEFAULT 0,
-                last_recovery_notify_ts REAL NOT NULL DEFAULT 0
+                last_recovery_notify_ts REAL NOT NULL DEFAULT 0,
+                gps_waiting INTEGER NOT NULL DEFAULT 0,
+                gps_wait_reason TEXT,
+                gps_wait_attempts INTEGER NOT NULL DEFAULT 0,
+                gps_wait_updated_at REAL
             )
             """
         )
@@ -317,6 +322,24 @@ def _init_db() -> None:
         try:
             conn.execute(
                 "ALTER TABLE devices ADD COLUMN last_recovery_notify_ts REAL NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                "ALTER TABLE devices ADD COLUMN gps_waiting INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE devices ADD COLUMN gps_wait_reason TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                "ALTER TABLE devices ADD COLUMN gps_wait_attempts INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE devices ADD COLUMN gps_wait_updated_at REAL")
         except sqlite3.OperationalError:
             pass
 
@@ -2331,7 +2354,8 @@ def list_devices():
             # used for base-station control flags.
             local = conn.execute(
                 """
-                SELECT force_oob, force_low_battery, freeze_lat, freeze_lng, last_seen
+                SELECT force_oob, force_low_battery, freeze_lat, freeze_lng, last_seen,
+                       gps_waiting, gps_wait_reason, gps_wait_attempts, gps_wait_updated_at
                 FROM devices
                 WHERE device_id = ? AND shelter_user_id = ?
                 """,
@@ -2345,6 +2369,12 @@ def list_devices():
                 entry["freeze_lng"] = local["freeze_lng"]
                 entry["last_seen"] = float(
                     local["last_seen"] or entry["last_seen"])
+                entry_data = entry.get("data") if isinstance(entry.get("data"), dict) else {}
+                entry_data["gps_waiting"] = bool(local["gps_waiting"] or 0)
+                entry_data["gps_wait_reason"] = str(local["gps_wait_reason"] or "")
+                entry_data["gps_wait_attempts"] = int(local["gps_wait_attempts"] or 0)
+                entry_data["gps_wait_updated_at"] = float(local["gps_wait_updated_at"] or 0.0)
+                entry["data"] = entry_data
 
             devices_view.append(_device_view(tracker_id, entry, effective_cfg))
 
@@ -2444,6 +2474,9 @@ def set_config():
     if gps_check_every_n_posts not in (1, 2, 5):
         gps_check_every_n_posts = 1
     server_config["gps_check_every_n_posts"] = gps_check_every_n_posts
+    server_config["force_wait_for_gps_lock"] = bool(
+        cfg.get("force_wait_for_gps_lock", server_config.get("force_wait_for_gps_lock", False))
+    )
 
     _save_server_config()
     return jsonify({"status": "ok", "config": _effective_server_config_for_request()})
@@ -2630,7 +2663,9 @@ def receive_data():
                 SET name = ?,
                     last_seen = ?,
                     shelter_user_id = COALESCE(shelter_user_id, ?),
-                    last_offline = 0
+                    last_offline = 0,
+                    gps_waiting = 0,
+                    gps_wait_reason = NULL
                 WHERE device_id = ?
                 """,
                 (name, now, shelter_user_id, device_id),
@@ -2964,6 +2999,46 @@ def receive_data():
         "tracker_ingest": heartbeat_result,
         "tracker_rename": rename_result,
     })
+
+
+@app.post("/gps_status")
+def receive_gps_status():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"status": "error", "error": "invalid_json"}), 400
+
+    device_id = str(payload.get("device_id") or "").strip()
+    if not device_id:
+        return jsonify({"status": "error", "error": "missing_device_id"}), 400
+
+    gps_waiting = bool(payload.get("gps_waiting", True))
+    gps_wait_reason = str(payload.get("gps_wait_reason") or "").strip()
+    gps_wait_attempts = max(0, _coerce_int(payload.get("gps_wait_attempts"), 0))
+    now = time.time()
+    shelter_user_id: Optional[str] = None
+
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT name, shelter_user_id FROM devices WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+        if not row:
+            return jsonify({"status": "ok", "config": _effective_server_config_for_user(None)})
+        shelter_user_id = str(row["shelter_user_id"]).strip() if row["shelter_user_id"] else None
+        conn.execute(
+            """
+            UPDATE devices
+            SET last_seen = ?,
+                gps_waiting = ?,
+                gps_wait_reason = ?,
+                gps_wait_attempts = ?,
+                gps_wait_updated_at = ?
+            WHERE device_id = ?
+            """,
+            (now, 1 if gps_waiting else 0, gps_wait_reason, gps_wait_attempts, now, device_id),
+        )
+
+    return jsonify({"status": "ok", "config": _effective_server_config_for_user(shelter_user_id)})
 
 
 @app.post("/device/<device_id>/oob")
