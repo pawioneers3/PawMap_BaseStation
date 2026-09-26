@@ -859,8 +859,8 @@
             <h2>Add Device (SoftAP Provisioning)</h2>
             <ol style="margin: 8px 0 0 18px; padding: 0;">
                 <li>Power on your ESP32.</li>
-                <li>On your computer, connect to WiFi: <b>ESP32-XXXX</b> (shown by the device).</li>
-                <li>Return to this page and click <b>Continue</b>.</li>
+                <li>Stay on your normal WiFi, fill in the fields, and click <b>Prepare Pairing</b>.</li>
+                <li>When prompted, connect to <b>ESP32-XXXX</b>, return to this open page without reloading, and click <b>Send Setup</b>.</li>
                 <li>After sending setup, your ESP32 will reboot and join your WiFi; your computer may also switch
                     back - this page will keep waiting.</li>
             </ol>
@@ -886,7 +886,7 @@
             <div class="status-line" id="pairingStatus"></div>
             <div class="actions">
                 <button onclick="closePairing()">Cancel</button>
-                <button class="primary" onclick="continuePairing()">Continue</button>
+                <button id="pairingContinue" class="primary" onclick="continuePairing()">Prepare Pairing</button>
             </div>
         </div>
     </div>
@@ -1060,28 +1060,27 @@
         }
 
         function mapJumpLimitMeters(bbox) {
-            if (!bbox) return 2000;
+            if (!bbox) return 500;
             const diagonal = distanceMeters(
                 { lat: bbox.minLat, lng: bbox.minLng },
                 { lat: bbox.maxLat, lng: bbox.maxLng }
             );
-            return clamp(diagonal * 20, 1000, 20000);
+            return clamp(diagonal, 100, 500);
         }
 
         function recentContinuousTrail(points, bbox) {
             const limit = mapTrailLimit();
             const jumpLimit = mapJumpLimitMeters(bbox);
             const kept = [];
-            let skippedJumps = 0;
             for (let i = points.length - 1; i >= 0 && kept.length < limit; i--) {
                 const current = points[i];
                 if (!current?.gps) continue;
                 if (kept.length) {
                     const previous = kept[kept.length - 1];
                     if (distanceMeters(current.gps, previous.gps) > jumpLimit) {
-                        skippedJumps += 1;
-                        if (skippedJumps > 5) break;
-                        continue;
+                        // A discontinuity starts a new trail; never bridge it
+                        // by skipping points and reconnecting older history.
+                        break;
                     }
                 }
                 kept.push(current);
@@ -1248,7 +1247,10 @@ document.getElementById("statOOB").textContent = oob;
         }
 
         // Pairing flow
+        let preparedPairing = null;
         function startPairing() {
+            preparedPairing = null;
+            document.getElementById("pairingContinue").textContent = "Prepare Pairing";
             const backdrop = document.getElementById("pairingBackdrop");
             backdrop.style.display = "flex";
             document.getElementById("pairingStatus").textContent = "";
@@ -1648,6 +1650,16 @@ document.getElementById("statOOB").textContent = oob;
         }
 
         async function continuePairing() {
+            const button = document.getElementById("pairingContinue");
+            button.disabled = true;
+            try {
+                await runPairingStep();
+            } finally {
+                button.disabled = false;
+            }
+        }
+
+        async function runPairingStep() {
             const statusEl = document.getElementById("pairingStatus");
             const ssid = document.getElementById("wifiSsid").value.trim();
             const password = document.getElementById("wifiPassword").value;
@@ -1665,6 +1677,14 @@ document.getElementById("statOOB").textContent = oob;
                 document.getElementById("deviceName").value = name;
             }
 
+            let claimToken = preparedPairing?.token || null;
+            if (preparedPairing && (preparedPairing.name !== name || Date.now() >= preparedPairing.expiresAt)) {
+                preparedPairing = null;
+                document.getElementById("pairingContinue").textContent = "Prepare Pairing";
+                statusEl.textContent = "Pairing expired or the name changed. Reconnect to normal WiFi and prepare pairing again.";
+                return;
+            }
+            if (!preparedPairing) {
             statusEl.textContent = "Checking for existing tracker names...";
             try {
                 const checkResp = await fetch("/pairing/check", {
@@ -1692,28 +1712,24 @@ document.getElementById("statOOB").textContent = oob;
                 // best effort: skip warning if the check fails
             }
 
-            statusEl.textContent = "Capturing current device list...";
-            let known = new Set();
-            let knownDevices = [];
-            let claimToken = null;
-            try {
-                const before = await fetchDevices(true);
-                knownDevices = before;
-                known = new Set(before.map(d => d.device_id));
-            } catch (_) {
-                // If you're currently on the ESP32 AP already, this fetch may fail. That's OK.
-            }
-
             try {
                 const claimResp = await fetch("/pairing/start", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ expected_name: name, ttl_s: 180, replace_existing: replaceExisting }),
+                    body: JSON.stringify({ expected_name: name, ttl_s: 600, replace_existing: replaceExisting }),
                 });
                 const claimJson = await claimResp.json().catch(() => ({}));
                 claimToken = claimJson?.claim_token || null;
+                if (!claimResp.ok || !claimToken) throw new Error("pairing_start_failed");
             } catch (_) {
-                // best effort: pairing can still proceed
+                statusEl.textContent = "Could not start pairing. Reconnect to the base station network and sign in, then try again.";
+                return;
+            }
+
+            preparedPairing = { token: claimToken, name, expiresAt: Date.now() + 600000 };
+            document.getElementById("pairingContinue").textContent = "Send Setup";
+            statusEl.textContent = "Ready. Now connect to ESP32-XXXX WiFi, return here without reloading, and click Send Setup within 10 minutes.";
+            return;
             }
 
             statusEl.textContent = "Sending setup to ESP32 (192.168.4.1)...";
@@ -1738,26 +1754,29 @@ document.getElementById("statOOB").textContent = oob;
                 try {
                     const devices = await fetchDevices(true);
                     renderDevices(devices);
-                    const expectedName = (name || "").trim().toLowerCase();
-                    const singleKnownDevice = knownDevices.length === 1 ? knownDevices[0] : null;
+                    const statusResp = await fetch(`/pairing/status?claim_token=${encodeURIComponent(claimToken)}`, { cache: "no-store" });
+                    if (!statusResp.ok) throw new Error("pairing_status_failed");
+                    const pairing = await statusResp.json();
                     for (const d of devices) {
-                        const deviceNameLc = (d.name || "").toString().trim().toLowerCase();
-                        const isNewDevice = !known.has(d.device_id);
-                        const isExpectedNameMatch = !!expectedName && deviceNameLc === expectedName;
-                        const isSingleKnownRepair = singleKnownDevice && d.device_id === singleKnownDevice.device_id;
-                        if (isNewDevice || isExpectedNameMatch || isSingleKnownRepair) {
+                        if (pairing.device_id === d.device_id) {
                             try {
-                                await fetch(`/device/${encodeURIComponent(d.device_id)}/claim`, {
+                                const claimResp = await fetch(`/device/${encodeURIComponent(d.device_id)}/claim`, {
                                     method: "POST",
                                     headers: { "Content-Type": "application/json" },
                                     body: JSON.stringify({ reset_history: false, expected_name: name }),
                                 });
+                                if (!claimResp.ok) {
+                                    statusEl.textContent = "Could not claim this device. Please retry pairing.";
+                                    return;
+                                }
                             } catch (_) {
-                                // best effort
+                                statusEl.textContent = "Could not reach the base station to confirm pairing. Please retry.";
+                                return;
                             }
                             d.name = name || d.name;
                             const display = d.name ? `${d.name} (${d.device_id})` : d.device_id;
                             statusEl.textContent = `Paired successfully: ${display}`;
+                            await pollLoop();
                             setTimeout(closePairing, 800);
                             return;
                         }
@@ -1886,7 +1905,7 @@ document.getElementById("statOOB").textContent = oob;
             const btn = e.target.closest(".delBtn");
             if (!btn) return;
             const deviceId = btn.dataset.id;
-            const ok = confirm(`Remove device ${deviceId}? This deletes it from the base station database and synced Supabase tracker history.`);
+            const ok = confirm(`Remove device ${deviceId}? It will stay removed from this base station until paired again. Cloud history cleanup will also be attempted.`);
             if (!ok) return;
             btn.disabled = true;
             btn.textContent = "Removing...";
@@ -1894,13 +1913,14 @@ document.getElementById("statOOB").textContent = oob;
                 const resp = await fetch(`/device/${encodeURIComponent(deviceId)}`, { method: "DELETE" });
                 if (!resp.ok) throw new Error("delete_failed");
                 const payload = await resp.json().catch(() => ({}));
-                if (payload?.supabase?.enabled && payload?.supabase?.ok === false) {
+                if (payload?.supabase?.ok === false) {
                     alert(`Device removed locally, but Supabase cleanup failed: ${payload.supabase.reason || "unknown error"}`);
                 }
             } catch (_) {
-                // ignore
+                alert("Could not remove the device. Please try again.");
             } finally {
                 btn.disabled = false;
+                btn.textContent = "Remove";
             }
             pollLoop();
         });

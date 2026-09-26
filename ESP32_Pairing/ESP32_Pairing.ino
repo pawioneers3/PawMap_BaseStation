@@ -5,6 +5,7 @@
 #include <ESPmDNS.h>
 #include <ArduinoJson.h>
 #include <HardwareSerial.h>
+#include <math.h>
 
 // ----- User-adjustable (optional) -----
 static const int RESET_BUTTON_PIN = 0; // BOOT button on many ESP32 DevKit V1 boards
@@ -74,6 +75,10 @@ MockConfig mockCfg;
 float gpsLat = 0.0f;
 float gpsLng = 0.0f;
 bool gpsInited = false;
+bool restoredLocationPending = false;
+float savedGpsLat = 0.0f;
+float savedGpsLng = 0.0f;
+bool hasSavedLocation = false;
 int batteryPct = 100;
 bool batteryInited = false;
 bool useRealGps = false;
@@ -141,6 +146,37 @@ static void clearConfig() {
   prefs.begin(PREF_NS, false);
   prefs.clear();
   prefs.end();
+}
+
+static void restoreLastLocation() {
+  float coordinates[2];
+  prefs.begin(PREF_NS, true);
+  bool loaded = prefs.getBytesLength("last_gps") == sizeof(coordinates) &&
+                prefs.getBytes("last_gps", coordinates, sizeof(coordinates)) == sizeof(coordinates);
+  prefs.end();
+  if (!loaded || !isfinite(coordinates[0]) || !isfinite(coordinates[1]) ||
+      fabsf(coordinates[0]) > 90.0f || fabsf(coordinates[1]) > 180.0f) return;
+  gpsLat = savedGpsLat = coordinates[0];
+  gpsLng = savedGpsLng = coordinates[1];
+  gpsInited = true;
+  hasSavedLocation = true;
+  restoredLocationPending = true;
+  Serial.printf("[GPS] Restored last location: %.6f, %.6f\n", gpsLat, gpsLng);
+}
+
+static void saveLastLocation() {
+  if (!gpsInited || !isfinite(gpsLat) || !isfinite(gpsLng) ||
+      fabsf(gpsLat) > 90.0f || fabsf(gpsLng) > 180.0f) return;
+  if (hasSavedLocation && gpsLat == savedGpsLat && gpsLng == savedGpsLng) return;
+  float coordinates[2] = {gpsLat, gpsLng};
+  prefs.begin(PREF_NS, false);
+  bool saved = prefs.putBytes("last_gps", coordinates, sizeof(coordinates)) == sizeof(coordinates);
+  prefs.end();
+  if (saved) {
+    savedGpsLat = gpsLat;
+    savedGpsLng = gpsLng;
+    hasSavedLocation = true;
+  }
 }
 
 static void handleRoot() {
@@ -672,15 +708,16 @@ static void applyConfigFromServer(const String &responseBody) {
     forceWaitForGpsLock = newForceWait;
   }
 
-  gpsInited = false; // re-seed after any GPS config change
+  // Configuration replies must not randomize the current position.
   Serial.printf("[CFG] post_interval_min=%lu gps_check_every_n_posts=%d force_wait_for_gps_lock=%s\n",
                 postIntervalMs / 60000UL, gpsCheckEveryNPosts, forceWaitForGpsLock ? "true" : "false");
 }
 
 static void postGpsWaitStatus(bool waiting, const String &reason) {
   String url = String("http://") + cfg.serverIp + ":5000/gps_status";
-  StaticJsonDocument<320> doc;
+  StaticJsonDocument<512> doc;
   doc["device_id"] = deviceId;
+  if (cfg.claimToken.length()) doc["claim_token"] = cfg.claimToken;
   doc["name"] = cfg.name.length() ? cfg.name : defaultNameFor(deviceId);
   doc["gps_waiting"] = waiting;
   doc["gps_wait_reason"] = reason;
@@ -807,7 +844,8 @@ static void maybePostData() {
     }
     if (!promotedToReal) {
       initMockGpsIfNeeded();
-      stepMockGps();
+      // First mock report after reboot repeats the saved location exactly.
+      if (!restoredLocationPending) stepMockGps();
     }
   }
   stepMockBattery();
@@ -842,6 +880,8 @@ static void maybePostData() {
     return;
   }
   http.addHeader("Content-Type", "application/json");
+  saveLastLocation();
+  restoredLocationPending = false;
   int code = http.POST((uint8_t *)payload.c_str(), payload.length());
 
   String respBody = "";
@@ -923,7 +963,7 @@ void setup() {
   }
 
   Serial.printf("[BOOT] Config found. SSID=%s server_ip=%s\n", cfg.ssid.c_str(), cfg.serverIp.c_str());
-  initGpsSourceOnBoot();
+  restoreLastLocation();
   normalMode();
 }
 
@@ -938,6 +978,13 @@ void loop() {
 
   ensureWifiConnected();
   ensureMdns();
+  if (WiFi.status() != WL_CONNECTED) return;
+  static bool gpsBootChecked = false;
+  if (!gpsBootChecked) {
+    postGpsWaitStatus(true, "initializing_gps");
+    initGpsSourceOnBoot();
+    gpsBootChecked = true;
+  }
   if (maybeHandleForcedGpsLockWait()) {
     delay(5);
     return;

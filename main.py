@@ -250,6 +250,17 @@ def _init_db() -> None:
         )
 
         # Best-effort migrations for existing DBs.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS removed_devices (
+                device_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                removed_at REAL NOT NULL
+            )
+        """)
+        if "pending_name" not in {
+            row["name"] for row in conn.execute("PRAGMA table_info(devices)")
+        }:
+            conn.execute("ALTER TABLE devices ADD COLUMN pending_name TEXT")
         try:
             conn.execute("ALTER TABLE devices ADD COLUMN shelter_user_id TEXT")
         except sqlite3.OperationalError:
@@ -804,8 +815,8 @@ def _delete_supabase_tracker_records(device_id: str) -> dict[str, Any]:
 
 def _rename_local_tracker_records(conn: sqlite3.Connection, device_id: str, name: str) -> None:
     conn.execute(
-        "UPDATE devices SET name = ? WHERE device_id = ?",
-        (name, device_id),
+        "UPDATE devices SET name = ?, pending_name = ? WHERE device_id = ?",
+        (name, name, device_id),
     )
     rows = conn.execute(
         "SELECT id, raw_json FROM readings WHERE device_id = ?",
@@ -1358,12 +1369,12 @@ def _send_supabase_tracker_heartbeat(
         return {**direct_result, "edge": {"enabled": False, "ok": False, "reason": "missing_supabase_key"}}
 
     try:
-        import requests  # type: ignore
+        import httpx
     except Exception:
-        return {**direct_result, "edge": {"enabled": False, "ok": False, "reason": "missing_requests"}}
+        return {**direct_result, "edge": {"enabled": False, "ok": False, "reason": "missing_httpx"}}
 
     try:
-        resp = requests.post(
+        resp = httpx.post(
             SUPABASE_TRACKER_INGEST_URL,
             headers={
                 "Content-Type": "application/json",
@@ -1520,6 +1531,11 @@ def _sync_supabase_tracker_row_to_local(
     if not tracker_id:
         return None
 
+    if conn.execute(
+        "SELECT 1 FROM removed_devices WHERE device_id = ?", (tracker_id,)
+    ).fetchone():
+        return None
+
     owner_id = _row_owner_user_id(row)
     if owner_id and owner_id != user_id:
         return None
@@ -1547,11 +1563,21 @@ def _sync_supabase_tracker_row_to_local(
         freeze_lng = None
 
     existing = conn.execute(
-        "SELECT device_id, first_seen, name FROM devices WHERE device_id = ?",
+        "SELECT device_id, first_seen, name, pending_name FROM devices WHERE device_id = ?",
         (tracker_id,),
     ).fetchone()
     name = supabase_name or _default_name(tracker_id)
     if existing:
+        # Keep an explicit local rename until the cloud acknowledges it.
+        # Otherwise polling can undo pairing before the next heartbeat syncs.
+        pending_name = existing["pending_name"]
+        if pending_name:
+            name = str(pending_name)
+            if supabase_name == pending_name:
+                conn.execute(
+                    "UPDATE devices SET pending_name = NULL WHERE device_id = ?",
+                    (tracker_id,),
+                )
         conn.execute(
             """
             UPDATE devices
@@ -2298,16 +2324,11 @@ def shelter_dashboard() -> Any:
 @app.get("/devices")
 @require_web_session_api
 def list_devices():
-    if not supabase_client:
-        return jsonify({
-            "devices": [],
-            "source": "supabase",
-            "error": "supabase_unavailable"
-        })
-
     effective_cfg = _effective_server_config_for_request()
-
+    cloud_error = None
     try:
+        if not supabase_client:
+            raise RuntimeError("supabase_unavailable")
         result = (
             supabase_client
             .table("animal_locations")
@@ -2318,11 +2339,8 @@ def list_devices():
         )
         rows = result.data or []
     except Exception as e:
-        return jsonify({
-            "devices": [],
-            "source": "supabase",
-            "error": str(e)
-        }), 500
+        rows = []
+        cloud_error = str(e)
 
     user = getattr(request, "user", None)
     user_id = str(getattr(user, "id", "") or "")
@@ -2354,9 +2372,7 @@ def list_devices():
             if not entry:
                 continue
 
-            # Supabase is authoritative for tracker identity/name so dashboards
-            # on other logged-in devices see the same value. Local state is only
-            # used for base-station control flags.
+            # Cloud names are used once any pending local rename is acknowledged.
             local = conn.execute(
                 """
                 SELECT force_oob, force_low_battery, freeze_lat, freeze_lng, last_seen,
@@ -2391,9 +2407,40 @@ def list_devices():
 
             devices_view.append(_device_view(tracker_id, entry, effective_cfg))
 
+        # Pairing is confirmed locally; cloud ingestion may be delayed or fail.
+        visible_ids = {device["device_id"] for device in devices_view}
+        local_rows = conn.execute(
+            """
+            SELECT * FROM devices
+            WHERE shelter_user_id = ?
+              AND device_id NOT IN (SELECT device_id FROM removed_devices)
+            """,
+            (user_id,),
+        ).fetchall()
+        for local in local_rows:
+            if local["device_id"] in visible_ids:
+                continue
+            latest = conn.execute(
+                "SELECT raw_json FROM readings WHERE device_id = ? ORDER BY ts DESC LIMIT 1",
+                (local["device_id"],),
+            ).fetchone()
+            try:
+                data = json.loads(latest["raw_json"]) if latest else {}
+            except (TypeError, ValueError):
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            data["name"] = local["name"]
+            data["gps_waiting"] = bool(local["gps_waiting"])
+            data["gps_wait_reason"] = local["gps_wait_reason"] or ""
+            entry = dict(local)
+            entry["data"] = data
+            devices_view.append(_device_view(local["device_id"], entry, effective_cfg))
+
     return jsonify({
         "devices": devices_view,
-        "source": "supabase"
+        "source": "local_and_supabase",
+        "cloud_error": cloud_error,
     })
 
 
@@ -2539,6 +2586,24 @@ def pairing_start():
     )
 
 
+@app.get("/pairing/status")
+@require_web_session_api
+def pairing_status():
+    user_id = str(getattr(getattr(request, "user", None), "id", "") or "")
+    with _db() as conn:
+        row = conn.execute(
+            """
+            SELECT p.claimed_device_id FROM pairing_claims p
+            JOIN devices d ON d.device_id = p.claimed_device_id
+            WHERE p.claim_token = ? AND p.user_id = ? AND d.shelter_user_id = ?
+              AND (p.claimed_at IS NOT NULL OR p.claimed_device_id IS NOT NULL)
+              AND d.device_id NOT IN (SELECT device_id FROM removed_devices)
+            """,
+            (request.args.get("claim_token", ""), user_id, user_id),
+        ).fetchone()
+    return jsonify({"device_id": row["claimed_device_id"] if row else None})
+
+
 @app.post("/pairing/check")
 @require_web_session_api
 def pairing_check():
@@ -2655,6 +2720,27 @@ def receive_data():
                 expected_name=incoming_name,
                 now_ts=now,
             )
+        removed = conn.execute(
+            "SELECT user_id, removed_at FROM removed_devices WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+        if removed:
+            # Only an explicit new pairing by the previous owner can restore it.
+            new_claim = conn.execute(
+                "SELECT created_at, claim_token FROM pairing_claims WHERE id = ?",
+                (pending_claim["id"],),
+            ).fetchone() if pending_claim else None
+            if not (
+                pending_claim
+                and pending_claim["user_id"] == removed["user_id"]
+                and new_claim
+                and float(new_claim["created_at"]) > float(removed["removed_at"])
+                and incoming_claim_token
+                and incoming_claim_token == new_claim["claim_token"]
+            ):
+                return jsonify({"status": "ignored", "reason": "device_removed"})
+            conn.execute("DELETE FROM removed_devices WHERE device_id = ?", (device_id,))
+
         if pending_claim:
             pending_user_id = str(pending_claim["user_id"])
             if not shelter_user_id or pending_user_id == shelter_user_id:
@@ -2695,6 +2781,8 @@ def receive_data():
             )
 
         if pending_claim_id is not None:
+            if expected_claim_name:
+                _rename_local_tracker_records(conn, device_id, expected_claim_name)
             conn.execute(
                 "UPDATE pairing_claims SET claimed_at = ?, claimed_device_id = ? WHERE id = ?",
                 (now, device_id, pending_claim_id),
@@ -3050,6 +3138,35 @@ def receive_gps_status():
     shelter_user_id: Optional[str] = None
 
     with _db() as conn:
+        token = str(payload.get("claim_token") or "").strip()
+        claim = conn.execute(
+            """SELECT * FROM pairing_claims
+               WHERE claim_token = ? AND claimed_at IS NULL AND expires_at >= ?
+               ORDER BY created_at DESC LIMIT 1""",
+            (token, now),
+        ).fetchone() if token else None
+        existing = conn.execute(
+            "SELECT shelter_user_id FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        removed = conn.execute(
+            "SELECT user_id, removed_at FROM removed_devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if claim and (not existing or not existing["shelter_user_id"] or existing["shelter_user_id"] == claim["user_id"]):
+            if removed and (removed["user_id"] != claim["user_id"] or claim["created_at"] <= removed["removed_at"]):
+                return jsonify({"status": "ignored", "reason": "device_removed"})
+            conn.execute("DELETE FROM removed_devices WHERE device_id = ?", (device_id,))
+            conn.execute(
+                """INSERT INTO devices(device_id, name, shelter_user_id, first_seen, last_seen, pending_name)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(device_id) DO UPDATE SET name=excluded.name,
+                   shelter_user_id=excluded.shelter_user_id, pending_name=excluded.pending_name""",
+                (device_id, claim["expected_name"], claim["user_id"], now, now, claim["expected_name"]),
+            )
+            # Leave the claim pending for /data to apply replacement handling.
+            conn.execute(
+                "UPDATE pairing_claims SET claimed_device_id = ? WHERE id = ?",
+                (device_id, claim["id"]),
+            )
         row = conn.execute(
             "SELECT name, shelter_user_id FROM devices WHERE device_id = ?",
             (device_id,),
@@ -3411,6 +3528,10 @@ def delete_device(device_id: str):
         if not row:
             return jsonify({"status": "error", "error": "not_found"}), 404
         deleted_name = str(row["name"] or "")
+        conn.execute(
+            "INSERT OR REPLACE INTO removed_devices(device_id, user_id, removed_at) VALUES (?, ?, ?)",
+            (device_id, user_id, time.time()),
+        )
         conn.execute("DELETE FROM devices WHERE device_id = ?", (device_id,))
     supabase_result = _delete_supabase_tracker_records(device_id)
 
