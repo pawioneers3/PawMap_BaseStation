@@ -123,7 +123,7 @@ If a shelter boundary exists in Supabase (`shelter_boundaries.polygon_geojson`),
 The base station can send:
 - **Out of bounds** notification (when the GPS first goes outside the box)
 - **Low battery** notification (when `battery < 10%`)
-- **Tracker disconnected** notification (when no tracker heartbeat is received for more than 90 seconds)
+- **Tracker disconnected** notification (after three minutes without a report at the default one-minute reporting interval; longer reporting intervals allow the interval plus one minute). The dashboard uses the same timeout and refreshes every two seconds.
 - **Tracker back online** notification (when a disconnected tracker reports again)
 - **Dog back in bounds** notification (when a previously out-of-bounds tracker returns to the safe area)
 

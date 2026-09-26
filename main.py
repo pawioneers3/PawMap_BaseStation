@@ -114,7 +114,8 @@ def _offline_timeout_s(cfg: Optional[dict[str, Any]] = None) -> int:
     post_interval_min = _coerce_int(active_cfg.get("post_interval_min"), 1)
     if post_interval_min not in (1, 5, 15, 30):
         post_interval_min = 1
-    return int((post_interval_min + 5) * 60)
+    # Use a three-minute minimum while allowing slower reporting intervals.
+    return max(180, int((post_interval_min + 1) * 60))
 
 
 def _is_empty_battery(value: Optional[int]) -> bool:
