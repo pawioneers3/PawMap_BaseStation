@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 from dotenv import load_dotenv
@@ -19,10 +19,12 @@ load_dotenv(BASE_DIR / ".env")
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret-change-me")
 
+if TYPE_CHECKING:
+    from supabase import Client
+
 try:
-    from supabase import Client, create_client
+    from supabase import create_client
 except Exception:
-    Client = Any
     create_client = None
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -44,7 +46,7 @@ if create_client and SUPABASE_URL:
         except Exception:
             supabase_client = None
 
-supabase_admin_client: Optional[Client] = None  # type: ignore[valid-type]
+supabase_admin_client: Optional[Client] = None
 if create_client and SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
     try:
         supabase_admin_client = create_client(
@@ -57,6 +59,17 @@ NOTIFY_COOLDOWN_S = 30
 BATTERY_LOW_THRESHOLD = 20
 BATTERY_EMPTY_THRESHOLD = 0
 OFFLINE_MONITOR_INTERVAL_S = 15
+
+SQL_TOUCH_FCM_TOKEN = 'UPDATE fcm_tokens SET last_used_at = ? WHERE token = ?'
+NOTIFICATION_ERROR_SEPARATOR = '\n---\n'
+SQL_DEVICE_OWNER = 'SELECT shelter_user_id FROM devices WHERE device_id = ?'
+SHELTER_NOTIFICATIONS_ROUTE = '/(shelter)/notifications'
+AUTH_PORTAL_TEMPLATE = 'auth_portal.html'
+LOW_BATTERY_TITLE = 'Low battery'
+SQL_DEVICE_FCM_TOKENS = """
+    SELECT token FROM fcm_tokens
+    WHERE device_id = ? OR device_id IS NULL
+"""
 
 
 server_config: dict[str, Any] = {
@@ -120,6 +133,16 @@ def _offline_timeout_s(cfg: Optional[dict[str, Any]] = None) -> int:
 
 def _is_empty_battery(value: Optional[int]) -> bool:
     return value is not None and value <= BATTERY_EMPTY_THRESHOLD
+
+
+def _tracker_heartbeat_status(battery: Optional[int], out_of_bounds: Any) -> str:
+    if _is_empty_battery(battery):
+        return "offline"
+    if out_of_bounds is True:
+        return "out_of_bounds"
+    if out_of_bounds is False:
+        return "in_bounds"
+    return "unknown"
 
 
 def _battery_health(value: Optional[int]) -> Optional[str]:
@@ -579,7 +602,7 @@ def _record_and_send_notification(
     with _db() as conn:
         for tok in tokens:
             conn.execute(
-                "UPDATE fcm_tokens SET last_used_at = ? WHERE token = ?",
+                SQL_TOUCH_FCM_TOKEN,
                 (now, tok),
             )
         conn.execute(
@@ -588,7 +611,7 @@ def _record_and_send_notification(
             VALUES(?, ?, ?, ?, ?, ?, ?)
             """,
             (device_id, now, kind, title, body,
-             1 if any_ok else 0, "\n---\n".join(responses)[:2000]),
+             1 if any_ok else 0, NOTIFICATION_ERROR_SEPARATOR.join(responses)[:2000]),
         )
 
 
@@ -1110,7 +1133,7 @@ def _supabase_target_user_ids_for_alerts(device_id: Optional[str] = None) -> lis
     if device_id:
         with _db() as conn:
             drow = conn.execute(
-                "SELECT shelter_user_id FROM devices WHERE device_id = ?",
+                SQL_DEVICE_OWNER,
                 (device_id,),
             ).fetchone()
             owner_id = str(drow["shelter_user_id"]).strip() if (
@@ -1730,10 +1753,7 @@ def _retry_failed_notifications(limit: int = 50) -> dict[str, int]:
             retried += 1
             device_id = str(row["device_id"])
             tokens_rows = conn.execute(
-                """
-                SELECT token FROM fcm_tokens
-                WHERE device_id = ? OR device_id IS NULL
-                """,
+                SQL_DEVICE_FCM_TOKENS,
                 (device_id,),
             ).fetchall()
             tokens = [str(r["token"]) for r in tokens_rows]
@@ -1752,7 +1772,7 @@ def _retry_failed_notifications(limit: int = 50) -> dict[str, int]:
                 responses.append(resp)
                 if ok:
                     conn.execute(
-                        "UPDATE fcm_tokens SET last_used_at = ? WHERE token = ?",
+                        SQL_TOUCH_FCM_TOKEN,
                         (time.time(), token),
                     )
 
@@ -1760,13 +1780,13 @@ def _retry_failed_notifications(limit: int = 50) -> dict[str, int]:
                 sent_ok += 1
                 conn.execute(
                     "UPDATE notifications SET ok = 1, response = ? WHERE id = ?",
-                    ("retried_ok\n---\n" + "\n---\n".join(responses))[:2000],
+                    ("retried_ok\n---\n" + NOTIFICATION_ERROR_SEPARATOR.join(responses))[:2000],
                     row["id"],
                 )
             else:
                 conn.execute(
                     "UPDATE notifications SET response = ? WHERE id = ?",
-                    ("\n---\n".join(responses)
+                    (NOTIFICATION_ERROR_SEPARATOR.join(responses)
                      [:2000] or str(row["response"] or "retry_failed")),
                     row["id"],
                 )
@@ -1813,10 +1833,7 @@ def _scan_and_notify_offline_devices(now: Optional[float] = None) -> int:
                 "offline_for_s": age_s if age_s is not None else "",
             }
             token_rows = conn.execute(
-                """
-                SELECT token FROM fcm_tokens
-                WHERE device_id = ? OR device_id IS NULL
-                """,
+                SQL_DEVICE_FCM_TOKENS,
                 (device_id,),
             ).fetchall()
             pending.append(
@@ -1853,7 +1870,7 @@ def _scan_and_notify_offline_devices(now: Optional[float] = None) -> int:
             category="tracker_offline",
             title=str(item["title"]),
             message=str(item["body"]),
-            route_path="/(shelter)/notifications",
+            route_path=SHELTER_NOTIFICATIONS_ROUTE,
             payload=item["data"],
         )
 
@@ -1922,6 +1939,17 @@ def _push_tokens_for_test(device_id: Optional[str] = None, include_global: bool 
     return tokens
 
 
+def _reported_battery(data: dict[str, Any]) -> Optional[int]:
+    for key in ("effective_battery", "battery"):
+        try:
+            value = data.get(key)
+            if value is not None:
+                return int(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return None
+
+
 def _device_view(
     device_id: str,
     entry: dict[str, Any],
@@ -1946,18 +1974,8 @@ def _device_view(
     else:
         status = "offline"
 
-    battery_value: Optional[int] = None
-    for key in ("effective_battery", "battery"):
-        try:
-            raw_battery = data.get(key)
-            if raw_battery is not None:
-                battery_value = int(raw_battery)
-                break
-        except Exception:
-            continue
-    if _is_empty_battery(battery_value):
-        status = "offline"
-    elif str(data.get("status") or "").strip().lower() == "offline":
+    battery_value = _reported_battery(data)
+    if _is_empty_battery(battery_value) or str(data.get("status") or "").strip().lower() == "offline":
         status = "offline"
 
     return {
@@ -2192,28 +2210,28 @@ def dashboard() -> str:
 def shelter_login() -> Any:
     if not supabase_client:
         return render_template(
-            "auth_portal.html",
+            AUTH_PORTAL_TEMPLATE,
             error=_supabase_unavailable_message(),
             info=None,
         )
     user, _ = _session_user()
     if user:
         return redirect(url_for("shelter_dashboard"))
-    return render_template("auth_portal.html", error=None, info=None)
+    return render_template(AUTH_PORTAL_TEMPLATE, error=None, info=None)
 
 
 @app.post("/shelter/sign-in")
 def shelter_sign_in() -> Any:
     if not supabase_client:
         return render_template(
-            "auth_portal.html",
+            AUTH_PORTAL_TEMPLATE,
             error=_supabase_unavailable_message(),
             info=None,
         ), 500
     email = (request.form.get("email") or "").strip()
     password = request.form.get("password") or ""
     if not email or not password:
-        return render_template("auth_portal.html", error="Email and password are required.", info=None), 400
+        return render_template(AUTH_PORTAL_TEMPLATE, error="Email and password are required.", info=None), 400
     try:
         auth_response = supabase_client.auth.sign_in_with_password(
             {"email": email, "password": password})
@@ -2221,7 +2239,7 @@ def shelter_sign_in() -> Any:
         auth_session = getattr(auth_response, "session", None)
         if not user or not auth_session:
             return render_template(
-                "auth_portal.html",
+                AUTH_PORTAL_TEMPLATE,
                 error="Sign-in did not return a session. Check email verification settings.",
                 info=None,
             ), 401
@@ -2232,14 +2250,14 @@ def shelter_sign_in() -> Any:
         session["sb_user_id"] = getattr(user, "id", None)
         return redirect(url_for("shelter_dashboard"))
     except Exception as e:
-        return render_template("auth_portal.html", error=f"Sign-in failed: {e}", info=None), 401
+        return render_template(AUTH_PORTAL_TEMPLATE, error=f"Sign-in failed: {e}", info=None), 401
 
 
 @app.post("/shelter/sign-up")
 def shelter_sign_up() -> Any:
     if not supabase_client:
         return render_template(
-            "auth_portal.html",
+            AUTH_PORTAL_TEMPLATE,
             error=_supabase_unavailable_message(),
             info=None,
         ), 500
@@ -2248,7 +2266,7 @@ def shelter_sign_up() -> Any:
     first_name = (request.form.get("first_name") or "").strip()
     last_name = (request.form.get("last_name") or "").strip()
     if not email or not password:
-        return render_template("auth_portal.html", error="Email and password are required.", info=None), 400
+        return render_template(AUTH_PORTAL_TEMPLATE, error="Email and password are required.", info=None), 400
     try:
         supabase_client.auth.sign_up(
             {
@@ -2258,12 +2276,12 @@ def shelter_sign_up() -> Any:
             }
         )
         return render_template(
-            "auth_portal.html",
+            AUTH_PORTAL_TEMPLATE,
             error=None,
             info="Sign-up successful. If email confirmation is enabled, verify your email, then sign in.",
         )
     except Exception as e:
-        return render_template("auth_portal.html", error=f"Sign-up failed: {e}", info=None), 400
+        return render_template(AUTH_PORTAL_TEMPLATE, error=f"Sign-up failed: {e}", info=None), 400
 
 
 @app.get("/shelter/logout")
@@ -2804,10 +2822,7 @@ def receive_data():
 
         def push_tokens_for_device() -> list[str]:
             rows = conn.execute(
-                """
-                SELECT token FROM fcm_tokens
-                WHERE device_id = ? OR device_id IS NULL
-                """,
+                SQL_DEVICE_FCM_TOKENS,
                 (device_id,),
             ).fetchall()
             return [str(r["token"]) for r in rows]
@@ -2920,7 +2935,9 @@ def receive_data():
 
         heartbeat_geofence = geofence
         out = geofence.get("out_of_bounds")
-        out_i = 1 if out is True else 0 if out is False else None
+        out_i = None
+        if isinstance(out, bool):
+            out_i = int(out)
         conn.execute(
             "UPDATE devices SET last_oob = ? WHERE device_id = ?",
             (out_i, device_id),
@@ -2936,22 +2953,14 @@ def receive_data():
             else:
                 effective_battery_i = min(effective_battery_i, forced_value)
 
-        batt_low = 1 if _is_low_battery(
-            effective_battery_i) else 0 if effective_battery_i is not None else None
+        batt_low = None
+        if effective_battery_i is not None:
+            batt_low = int(_is_low_battery(effective_battery_i))
         heartbeat_effective_battery = effective_battery_i
         heartbeat_battery_low = bool(
             batt_low) if batt_low is not None else None
         heartbeat_battery_health = _battery_health(effective_battery_i)
-        heartbeat_status = (
-            "offline"
-            if _is_empty_battery(effective_battery_i)
-            else
-            "out_of_bounds"
-            if out is True
-            else "in_bounds"
-            if out is False
-            else "unknown"
-        )
+        heartbeat_status = _tracker_heartbeat_status(effective_battery_i, out)
         if _is_empty_battery(effective_battery_i):
             queued_notifications = [
                 notification
@@ -3046,7 +3055,7 @@ def receive_data():
             queued_notifications.append(
                 {
                     "kind": "low_battery",
-                    "title": "Low battery",
+                    "title": LOW_BATTERY_TITLE,
                     "body": f"{name} battery is low ({effective_battery_i}%).",
                     "data": notify_data,
                     "tokens": push_tokens_for_device(),
@@ -3104,7 +3113,7 @@ def receive_data():
             category=f"tracker_{notification['kind']}",
             title=str(notification["title"]),
             message=str(notification["body"]),
-            route_path="/(shelter)/notifications",
+            route_path=SHELTER_NOTIFICATIONS_ROUTE,
             payload=notification["data"],
         )
     return jsonify({
@@ -3147,7 +3156,7 @@ def receive_gps_status():
             (token, now),
         ).fetchone() if token else None
         existing = conn.execute(
-            "SELECT shelter_user_id FROM devices WHERE device_id = ?", (device_id,)
+            SQL_DEVICE_OWNER, (device_id,)
         ).fetchone()
         removed = conn.execute(
             "SELECT user_id, removed_at FROM removed_devices WHERE device_id = ?", (device_id,)
@@ -3206,8 +3215,6 @@ def set_device_oob(device_id: str):
     force_low_battery = False
     freeze_lat: Optional[float] = None
     freeze_lng: Optional[float] = None
-
-    rename_supabase_history = False
 
     with _db() as conn:
         row = conn.execute(
@@ -3321,10 +3328,7 @@ def set_device_low_battery(device_id: str):
                 (now, device_id),
             )
             token_rows = conn.execute(
-                """
-                SELECT token FROM fcm_tokens
-                WHERE device_id = ? OR device_id IS NULL
-                """,
+                SQL_DEVICE_FCM_TOKENS,
                 (device_id,),
             ).fetchall()
             tokens = [str(r["token"]) for r in token_rows]
@@ -3351,7 +3355,7 @@ def set_device_low_battery(device_id: str):
         _record_and_send_notification(
             device_id=device_id,
             kind="low_battery",
-            title="Low battery",
+            title=LOW_BATTERY_TITLE,
             body=f"{device_name} battery is low ({effective_battery_i}%).",
             now=now,
             tokens=tokens,
@@ -3360,9 +3364,9 @@ def set_device_low_battery(device_id: str):
         alert_result = _send_supabase_notification(
             device_id=device_id,
             category="tracker_low_battery",
-            title="Low battery",
+            title=LOW_BATTERY_TITLE,
             message=f"{device_name} battery is low ({effective_battery_i}%).",
-            route_path="/(shelter)/notifications",
+            route_path=SHELTER_NOTIFICATIONS_ROUTE,
             payload=notify_data,
         )
         alert_result["sent"] = True
@@ -3643,7 +3647,7 @@ def notifications_test_push():
             ok_count += 1
             with _db() as conn:
                 conn.execute(
-                    "UPDATE fcm_tokens SET last_used_at = ? WHERE token = ?",
+                    SQL_TOUCH_FCM_TOKEN,
                     (now, token),
                 )
         else:
@@ -3658,7 +3662,7 @@ def notifications_test_push():
             category="tracker_test",
             title=title,
             message=body,
-            route_path="/(shelter)/notifications",
+            route_path=SHELTER_NOTIFICATIONS_ROUTE,
             payload={"event": "test", "device_id": device_id or "",
                      "sent_at": str(int(now))},
         )
@@ -3707,7 +3711,7 @@ def history(device_id: str):
 
     with _db() as conn:
         owner_row = conn.execute(
-            "SELECT shelter_user_id FROM devices WHERE device_id = ?",
+            SQL_DEVICE_OWNER,
             (device_id,),
         ).fetchone()
         if not owner_row:
@@ -3719,7 +3723,7 @@ def history(device_id: str):
                     row=latest,
                 )
                 owner_row = conn.execute(
-                    "SELECT shelter_user_id FROM devices WHERE device_id = ?",
+                    SQL_DEVICE_OWNER,
                     (device_id,),
                 ).fetchone()
         if not owner_row or str(owner_row["shelter_user_id"] or "") != user_id:
