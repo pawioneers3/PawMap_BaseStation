@@ -1370,12 +1370,12 @@ def _send_supabase_tracker_heartbeat(
         return {**direct_result, "edge": {"enabled": False, "ok": False, "reason": "missing_supabase_key"}}
 
     try:
-        import httpx
+        import requests  # type: ignore
     except Exception:
-        return {**direct_result, "edge": {"enabled": False, "ok": False, "reason": "missing_httpx"}}
+        return {**direct_result, "edge": {"enabled": False, "ok": False, "reason": "missing_requests"}}
 
     try:
-        resp = httpx.post(
+        resp = requests.post(
             SUPABASE_TRACKER_INGEST_URL,
             headers={
                 "Content-Type": "application/json",
@@ -2597,7 +2597,7 @@ def pairing_status():
             SELECT p.claimed_device_id FROM pairing_claims p
             JOIN devices d ON d.device_id = p.claimed_device_id
             WHERE p.claim_token = ? AND p.user_id = ? AND d.shelter_user_id = ?
-              AND (p.claimed_at IS NOT NULL OR p.claimed_device_id IS NOT NULL)
+              AND p.claimed_at IS NOT NULL
               AND d.device_id NOT IN (SELECT device_id FROM removed_devices)
             """,
             (request.args.get("claim_token", ""), user_id, user_id),
